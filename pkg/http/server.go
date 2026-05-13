@@ -3,19 +3,31 @@ package http
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
+// ServeContext creates a TCP listener on addr and serves HTTP(S) requests until ctx is cancelled.
 func ServeContext(ctx context.Context, addr string, hdl http.Handler, tlsConfig *tls.Config) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
+	return serve(ctx, ln, hdl, tlsConfig)
+}
+
+func serve(ctx context.Context, ln net.Listener, hdl http.Handler, tlsConfig *tls.Config) error {
 	srv := &http.Server{
-		Handler:   hdl,
-		Addr:      addr,
-		TLSConfig: tlsConfig,
+		Handler:           hdl,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: time.Minute, // mitigate Slowloris attacks
 	}
 
-	go func() {
+	go func() { //nolint:gosec // G118: ctx is already cancelled here; shutdown needs a fresh context
 		<-ctx.Done()
 
 		if err := srv.Shutdown(context.Background()); err != nil {
@@ -25,8 +37,7 @@ func ServeContext(ctx context.Context, addr string, hdl http.Handler, tlsConfig 
 	}()
 
 	if tlsConfig != nil {
-		return srv.ListenAndServeTLS("", "")
+		return srv.ServeTLS(ln, "", "")
 	}
-
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }

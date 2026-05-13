@@ -3,57 +3,60 @@ package config
 import (
 	"time"
 
-	"github.com/kelseyhightower/envconfig"
+	"github.com/caarlos0/env/v11"
 )
 
 // Serving is configuration for how the interceptor serves the proxy
 // and admin server
 type Serving struct {
-	// CurrentNamespace is the namespace that the interceptor is
-	// currently running in
-	CurrentNamespace string `envconfig:"KEDA_HTTP_CURRENT_NAMESPACE" required:"true"`
 	// WatchNamespace is the namespace to watch for new HTTPScaledObjects.
 	// Leave this empty to watch HTTPScaledObjects in all namespaces.
-	WatchNamespace string `envconfig:"KEDA_HTTP_WATCH_NAMESPACE" default:""`
+	WatchNamespace string `env:"KEDA_HTTP_WATCH_NAMESPACE" envDefault:""`
 	// ProxyPort is the port that the public proxy should run on
-	ProxyPort int `envconfig:"KEDA_HTTP_PROXY_PORT" required:"true"`
+	ProxyPort int `env:"KEDA_HTTP_PROXY_PORT,required"`
 	// AdminPort is the port that the internal admin server should run on.
 	// This is the server that the external scaler will issue metrics
 	// requests to
-	AdminPort int `envconfig:"KEDA_HTTP_ADMIN_PORT" required:"true"`
-	// ConfigMapCacheRsyncPeriod is the time interval
-	// for the configmap informer to rsync the local cache.
-	ConfigMapCacheRsyncPeriod time.Duration `envconfig:"KEDA_HTTP_SCALER_CONFIG_MAP_INFORMER_RSYNC_PERIOD" default:"60m"`
-	// The interceptor has an internal process that periodically fetches the state
-	// of endpoints that is running the servers it forwards to.
-	//
-	// This is the interval (in milliseconds) representing how often to do a fetch
-	EndpointsCachePollIntervalMS int `envconfig:"KEDA_HTTP_ENDPOINTS_CACHE_POLLING_INTERVAL_MS" default:"250"`
+	AdminPort int `env:"KEDA_HTTP_ADMIN_PORT,required"`
+	// CacheSyncPeriod is the time interval for the controller-runtime cache to resync.
+	// TODO: consider removing this to use the default value, otherwise align the env var name
+	CacheSyncPeriod time.Duration `env:"KEDA_HTTP_SCALER_CONFIG_MAP_INFORMER_RSYNC_PERIOD" envDefault:"60m"`
 	// ProxyTLSEnabled is a flag to specify whether the interceptor proxy should
 	// be running using a TLS enabled server
-	ProxyTLSEnabled bool `envconfig:"KEDA_HTTP_PROXY_TLS_ENABLED" default:"false"`
+	ProxyTLSEnabled bool `env:"KEDA_HTTP_PROXY_TLS_ENABLED" envDefault:"false"`
 	// TLSCertPath is the path to read the certificate file from for the TLS server
-	TLSCertPath string `envconfig:"KEDA_HTTP_PROXY_TLS_CERT_PATH" default:"/certs/tls.crt"`
+	TLSCertPath string `env:"KEDA_HTTP_PROXY_TLS_CERT_PATH" envDefault:"/certs/tls.crt"`
 	// TLSKeyPath is the path to read the private key file from for the TLS server
-	TLSKeyPath string `envconfig:"KEDA_HTTP_PROXY_TLS_KEY_PATH" default:"/certs/tls.key"`
+	TLSKeyPath string `env:"KEDA_HTTP_PROXY_TLS_KEY_PATH" envDefault:"/certs/tls.key"`
 	// TLSCertStorePaths is a comma separated list of paths to read the certificate/key pairs for the TLS server
-	TLSCertStorePaths string `envconfig:"KEDA_HTTP_PROXY_TLS_CERT_STORE_PATHS" default:""`
+	TLSCertStorePaths string `env:"KEDA_HTTP_PROXY_TLS_CERT_STORE_PATHS" envDefault:""`
 	// TLSSkipVerify is a boolean flag to specify whether the interceptor should skip TLS verification for upstreams
-	TLSSkipVerify bool `envconfig:"KEDA_HTTP_PROXY_TLS_SKIP_VERIFY" default:"false"`
+	TLSSkipVerify bool `env:"KEDA_HTTP_PROXY_TLS_SKIP_VERIFY" envDefault:"false"`
 	// TLSPort is the port that the server should serve on if TLS is enabled
-	TLSPort int `envconfig:"KEDA_HTTP_PROXY_TLS_PORT" default:"8443"`
+	TLSPort int `env:"KEDA_HTTP_PROXY_TLS_PORT" envDefault:"8443"`
+	// TLSMinVersion is the minimum TLS version to accept ("1.2" or "1.3").
+	// If empty, the Go default is used (currently TLS 1.2).
+	TLSMinVersion string `env:"KEDA_HTTP_PROXY_TLS_MIN_VERSION" envDefault:""`
+	// TLSMaxVersion is the maximum TLS version to accept ("1.2" or "1.3").
+	// Defaults to the highest version supported by crypto/tls if empty.
+	TLSMaxVersion string `env:"KEDA_HTTP_PROXY_TLS_MAX_VERSION" envDefault:""`
+	// TLSCipherSuites is a comma-separated list of TLS cipher suite names
+	// (e.g. "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384").
+	// If empty, the default Go cipher suites are used.
+	TLSCipherSuites string `env:"KEDA_HTTP_PROXY_TLS_CIPHER_SUITES" envDefault:""`
+	// TLSCurvePreferences is a comma-separated list of elliptic curve names
+	// (e.g. "X25519,CurveP256"). If empty, the default Go curve preferences are used.
+	TLSCurvePreferences string `env:"KEDA_HTTP_PROXY_TLS_CURVE_PREFERENCES" envDefault:""`
 	// ProfilingAddr if not empty, pprof will be available on this address, assuming host:port here
-	ProfilingAddr string `envconfig:"PROFILING_BIND_ADDRESS" default:""`
+	ProfilingAddr string `env:"PROFILING_BIND_ADDRESS" envDefault:""`
 	// EnableColdStartHeader enables/disables the X-KEDA-HTTP-Cold-Start response header
-	EnableColdStartHeader bool `envconfig:"KEDA_HTTP_ENABLE_COLD_START_HEADER" default:"true"`
+	EnableColdStartHeader bool `env:"KEDA_HTTP_ENABLE_COLD_START_HEADER" envDefault:"true"`
 	// LogRequests enables/disables logging of incoming requests
-	LogRequests bool `envconfig:"KEDA_HTTP_LOG_REQUESTS" default:"false"`
+	LogRequests bool `env:"KEDA_HTTP_LOG_REQUESTS" envDefault:"false"`
 }
 
-// MustParseServing parses standard configs using envconfig and returns the
+// MustParseServing parses standard configs and returns the
 // newly created config. It panics if parsing fails.
 func MustParseServing() Serving {
-	var ret Serving
-	envconfig.MustProcess("", &ret)
-	return ret
+	return env.Must(env.ParseAs[Serving]())
 }

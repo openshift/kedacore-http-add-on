@@ -2,36 +2,42 @@ package middleware
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/kedacore/http-add-on/interceptor/metrics"
 )
 
+// Metrics records request count and duration with bounded route identity labels.
+// It creates a routeInfo in the request context before calling next, and reads
+// the (potentially mutated) routeInfo after next returns to set metric labels.
 type Metrics struct {
-	upstreamHandler http.Handler
+	next        http.Handler
+	instruments *metrics.Instruments
 }
 
-func NewMetrics(upstreamHandler http.Handler) *Metrics {
+var _ http.Handler = (*Metrics)(nil)
+
+func NewMetrics(next http.Handler, instruments *metrics.Instruments) *Metrics {
+	if instruments == nil {
+		panic("instruments must not be nil")
+	}
 	return &Metrics{
-		upstreamHandler: upstreamHandler,
+		next:        next,
+		instruments: instruments,
 	}
 }
 
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w = newResponseWriter(w)
+	// Pass through context so routing can report which route was matched
+	info := &routeInfo{}
+	r = r.WithContext(contextWithRouteInfo(r.Context(), info))
 
-	defer m.metrics(w, r)
+	rw := newInstrumentedResponseWriter(w)
+	start := time.Now()
 
-	m.upstreamHandler.ServeHTTP(w, r)
-}
+	defer func() {
+		m.instruments.RecordRequest(r.Method, rw.statusCode, info.Name, info.Namespace, time.Since(start))
+	}()
 
-func (m *Metrics) metrics(w http.ResponseWriter, r *http.Request) {
-	mrw := w.(*responseWriter)
-	if mrw == nil {
-		mrw = newResponseWriter(w)
-	}
-
-	// exclude readiness & liveness probes from the emitted metrics
-	if r.URL.Path != "/livez" && r.URL.Path != "/readyz" {
-		metrics.RecordRequestCount(r.Method, r.URL.Path, mrw.statusCode, r.Host)
-	}
+	m.next.ServeHTTP(rw, r)
 }

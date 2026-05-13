@@ -14,7 +14,7 @@ type HostAndCount struct {
 }
 type FakeCounter struct {
 	mapMut        *sync.RWMutex
-	RetMap        map[string]Count
+	RetMap        Counts
 	ResizedCh     chan HostAndCount
 	ResizeTimeout time.Duration
 }
@@ -35,7 +35,7 @@ func NewFakeCounterBuffered() *FakeCounter {
 func newFakeCounter(bufferSize int) *FakeCounter {
 	return &FakeCounter{
 		mapMut:        new(sync.RWMutex),
-		RetMap:        map[string]Count{},
+		RetMap:        Counts{},
 		ResizedCh:     make(chan HostAndCount, bufferSize),
 		ResizeTimeout: 1 * time.Second,
 	}
@@ -45,7 +45,7 @@ func (f *FakeCounter) Increase(host string, i int) error {
 	f.mapMut.Lock()
 	count := f.RetMap[host]
 	count.Concurrency += i
-	count.RPS += float64(i)
+	count.RequestCount += int64(i)
 	f.RetMap[host] = count
 	f.mapMut.Unlock()
 	select {
@@ -76,15 +76,13 @@ func (f *FakeCounter) Decrease(host string, i int) error {
 	return nil
 }
 
-func (f *FakeCounter) EnsureKey(host string, _, _ time.Duration) {
+func (f *FakeCounter) EnsureKey(host string) {
 	f.mapMut.Lock()
 	defer f.mapMut.Unlock()
-	f.RetMap[host] = Count{
-		Concurrency: 0,
+	if _, ok := f.RetMap[host]; !ok {
+		f.RetMap[host] = Count{}
 	}
 }
-
-func (f *FakeCounter) UpdateBuckets(_ string, _, _ time.Duration) {}
 
 func (f *FakeCounter) RemoveKey(host string) bool {
 	f.mapMut.Lock()
@@ -94,30 +92,25 @@ func (f *FakeCounter) RemoveKey(host string) bool {
 	return ok
 }
 
-func (f *FakeCounter) Current() (*Counts, error) {
-	ret := NewCounts()
+func (f *FakeCounter) Current() (Counts, error) {
 	f.mapMut.RLock()
 	defer f.mapMut.RUnlock()
-	retMap := f.RetMap
-	ret.Counts = retMap
-	return ret, nil
+	return f.RetMap, nil
 }
 
 var _ CountReader = &FakeCountReader{}
 
 type FakeCountReader struct {
-	concurrency int
-	rps         float64
-	err         error
+	concurrency  int
+	requestCount int64
+	err          error
 }
 
-func (f *FakeCountReader) Current() (*Counts, error) {
-	ret := NewCounts()
-	ret.Counts = map[string]Count{
+func (f *FakeCountReader) Current() (Counts, error) {
+	return Counts{
 		"sample.com": {
-			Concurrency: f.concurrency,
-			RPS:         f.rps,
+			Concurrency:  f.concurrency,
+			RequestCount: f.requestCount,
 		},
-	}
-	return ret, f.err
+	}, f.err
 }

@@ -5,56 +5,54 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"regexp"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kedacore/http-add-on/interceptor/handler"
-	httpv1alpha1 "github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
-	"github.com/kedacore/http-add-on/pkg/k8s"
+	httpv1beta "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
 	"github.com/kedacore/http-add-on/pkg/routing"
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
-var (
-	kubernetesProbeUserAgent = regexp.MustCompile(`(^|\s)kube-probe/`)
-	googleHCUserAgent        = regexp.MustCompile(`(^|\s)GoogleHC/`)
-	awsELBserAgent           = regexp.MustCompile(`(^|\s)ELB-HealthChecker/`)
-)
-
 type Routing struct {
-	routingTable    routing.Table
-	probeHandler    http.Handler
-	upstreamHandler http.Handler
-	svcCache        k8s.ServiceCache
-	tlsEnabled      bool
+	routingTable   routing.Table
+	next           http.Handler
+	reader         client.Reader
+	tlsEnabled     bool
+	requestTimeout time.Duration
 }
 
-func NewRouting(routingTable routing.Table, probeHandler http.Handler, upstreamHandler http.Handler, svcCache k8s.ServiceCache, tlsEnabled bool) *Routing {
+func NewRouting(next http.Handler, routingTable routing.Table, reader client.Reader, tlsEnabled bool, requestTimeout time.Duration) *Routing {
 	return &Routing{
-		routingTable:    routingTable,
-		probeHandler:    probeHandler,
-		upstreamHandler: upstreamHandler,
-		svcCache:        svcCache,
-		tlsEnabled:      tlsEnabled,
+		routingTable:   routingTable,
+		next:           next,
+		reader:         reader,
+		tlsEnabled:     tlsEnabled,
+		requestTimeout: requestTimeout,
 	}
 }
 
 var _ http.Handler = (*Routing)(nil)
 
 func (rm *Routing) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	httpso := rm.routingTable.Route(r)
-	if httpso == nil {
-		if rm.isProbe(r) {
-			rm.probeHandler.ServeHTTP(w, r)
-			return
-		}
-
+	ir := rm.routingTable.Route(r)
+	if ir == nil {
 		sh := handler.NewStatic(http.StatusNotFound, nil)
 		sh.ServeHTTP(w, r)
 
 		return
 	}
 
-	stream, err := rm.streamFromHTTPSO(r.Context(), httpso, httpso.Spec.ScaleTargetRef)
+	// Populate route identity for metric labels.
+	if info := routeInfoFromContext(r.Context()); info != nil {
+		info.Name = ir.Name
+		info.Namespace = ir.Namespace
+	}
+
+	url, err := rm.resolveUpstreamURL(r.Context(), ir.Spec.Target.AsServiceRef(), ir.Namespace)
 	if err != nil {
 		sh := handler.NewStatic(http.StatusInternalServerError, err)
 		sh.ServeHTTP(w, r)
@@ -66,50 +64,59 @@ func (rm *Routing) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := util.LoggerFromContext(ctx)
 	ctx = util.ContextWithLogger(ctx, logger.WithName("RoutingMiddleware"))
-	ctx = util.ContextWithHTTPSO(ctx, httpso)
-	ctx = util.ContextWithStream(ctx, stream)
+	ctx = util.ContextWithInterceptorRoute(ctx, ir)
+	ctx = util.ContextWithUpstreamURL(ctx, url)
 
-	if httpso.Spec.ColdStartTimeoutFailoverRef != nil {
-		failoverStream, err := rm.streamFromHTTPSO(ctx, httpso, httpso.Spec.ColdStartTimeoutFailoverRef)
+	if ir.Spec.ColdStart != nil && ir.Spec.ColdStart.Fallback != nil && ir.Spec.ColdStart.Fallback.Service != nil {
+		fallbackURL, err := rm.resolveUpstreamURL(ctx, *ir.Spec.ColdStart.Fallback.Service, ir.Namespace)
 		if err != nil {
 			sh := handler.NewStatic(http.StatusInternalServerError, err)
 			sh.ServeHTTP(w, r)
 			return
 		}
-		ctx = util.ContextWithFailoverStream(ctx, failoverStream)
+
+		ctx = util.ContextWithFallbackURL(ctx, fallbackURL)
+	}
+
+	// Apply per-route or global request deadline
+	requestTimeout := rm.requestTimeout
+	if ir.Spec.Timeouts.Request != nil {
+		requestTimeout = ir.Spec.Timeouts.Request.Duration
+	}
+	if requestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
+		defer cancel()
 	}
 
 	r = r.WithContext(ctx)
-	rm.upstreamHandler.ServeHTTP(w, r)
+	rm.next.ServeHTTP(w, r)
 }
 
-func (rm *Routing) getPort(ctx context.Context, httpso *httpv1alpha1.HTTPScaledObject, reference httpv1alpha1.Ref) (int32, error) {
-	var (
-		port        = reference.GetPort()
-		portName    = reference.GetPortName()
-		serviceName = reference.GetServiceName()
-	)
-
-	if port != 0 {
-		return port, nil
+func (rm *Routing) resolvePort(ctx context.Context, svc httpv1beta.ServiceRef, namespace string) (int32, error) {
+	if svc.Port != 0 {
+		return svc.Port, nil
 	}
-	if portName == "" {
+	if svc.PortName == "" {
 		return 0, fmt.Errorf(`must specify either "port" or "portName"`)
 	}
-	svc, err := rm.svcCache.Get(ctx, httpso.GetNamespace(), serviceName)
+
+	var k8sSvc corev1.Service
+	err := rm.reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: svc.Name}, &k8sSvc)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get Service: %w", err)
 	}
-	for _, port := range svc.Spec.Ports {
-		if port.Name == portName {
+
+	for _, port := range k8sSvc.Spec.Ports {
+		if svc.PortName == port.Name {
 			return port.Port, nil
 		}
 	}
-	return 0, fmt.Errorf("portName %q not found in Service", portName)
+	return 0, fmt.Errorf("port name %q not found in Service", svc.PortName)
 }
 
-func (rm *Routing) streamFromHTTPSO(ctx context.Context, httpso *httpv1alpha1.HTTPScaledObject, reference httpv1alpha1.Ref) (*url.URL, error) {
-	port, err := rm.getPort(ctx, httpso, reference)
+func (rm *Routing) resolveUpstreamURL(ctx context.Context, svc httpv1beta.ServiceRef, namespace string) (*url.URL, error) {
+	port, err := rm.resolvePort(ctx, svc, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get port: %w", err)
 	}
@@ -121,12 +128,6 @@ func (rm *Routing) streamFromHTTPSO(ctx context.Context, httpso *httpv1alpha1.HT
 
 	return &url.URL{
 		Scheme: scheme,
-		Host:   fmt.Sprintf("%s.%s:%d", reference.GetServiceName(), httpso.GetNamespace(), port),
+		Host:   fmt.Sprintf("%s.%s:%d", svc.Name, namespace, port),
 	}, nil
-}
-
-func (rm *Routing) isProbe(r *http.Request) bool {
-	ua := r.UserAgent()
-
-	return kubernetesProbeUserAgent.Match([]byte(ua)) || googleHCUserAgent.Match([]byte(ua)) || awsELBserAgent.Match([]byte(ua))
 }

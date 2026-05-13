@@ -12,9 +12,10 @@ import (
 type Probe struct {
 	healthCheckers []util.HealthChecker
 	healthy        atomic.Bool
+	hasBeenHealthy atomic.Bool
 }
 
-func NewProbe(healthChecks []util.HealthChecker) *Probe {
+func NewProbe(healthChecks ...util.HealthChecker) *Probe {
 	return &Probe{
 		healthCheckers: healthChecks,
 	}
@@ -40,13 +41,15 @@ func (ph *Probe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (ph *Probe) Start(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		ph.check(ctx)
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second):
+		case <-ticker.C:
 			continue
 		}
 	}
@@ -60,10 +63,17 @@ func (ph *Probe) check(ctx context.Context) {
 		if err := hc.HealthCheck(ctx); err != nil {
 			ph.healthy.Store(false)
 
-			logger.Error(err, "health check function failed")
+			// Log at info level before the first successful check to avoid
+			// noisy error logs during normal startup sequencing.
+			if ph.hasBeenHealthy.Load() {
+				logger.Error(err, "health check function failed")
+			} else {
+				logger.Info("waiting for health check to pass", "error", err)
+			}
 			return
 		}
 	}
 
 	ph.healthy.Store(true)
+	ph.hasBeenHealthy.Store(true)
 }
