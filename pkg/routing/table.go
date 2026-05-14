@@ -3,99 +3,172 @@ package routing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/cache"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	httpv1alpha1 "github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
-	"github.com/kedacore/http-add-on/operator/generated/informers/externalversions"
-	informershttpv1alpha1 "github.com/kedacore/http-add-on/operator/generated/informers/externalversions/http/v1alpha1"
+	httpv1beta1 "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	"github.com/kedacore/http-add-on/pkg/queue"
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
-var (
-	errUnknownSharedIndexInformer = errors.New("informer is not cache.sharedIndexInformer")
-	errStartedSharedIndexInformer = errors.New("sharedIndexInformer has started, run more than once is not allowed")
-	errStoppedSharedIndexInformer = errors.New("sharedIndexInformer has stopped")
-	errNotSyncedTable             = errors.New("table has not synced")
-)
+var errNotSyncedTable = errors.New("table has not synced")
 
 type Table interface {
 	util.HealthChecker
 
-	Start(ctx context.Context) error
-	Route(req *http.Request) *httpv1alpha1.HTTPScaledObject
 	HasSynced() bool
+	Route(req *http.Request) *httpv1beta1.InterceptorRoute
+	Signal()
+	Start(ctx context.Context) error
 }
 
 type table struct {
-	httpScaledObjectInformer                 sharedIndexInformer
-	httpScaledObjectEventHandlerRegistration cache.ResourceEventHandlerRegistration
-	httpScaledObjects                        map[types.NamespacedName]*httpv1alpha1.HTTPScaledObject
-	httpScaledObjectsMutex                   sync.RWMutex
-	memoryHolder                             util.AtomicValue[*TableMemory]
-	memorySignaler                           util.Signaler
-	queueCounter                             queue.Counter
+	memoryHolder   util.AtomicValue[*TableMemory]
+	memorySignaler util.Signaler
+	previousKeys   map[string]struct{}
+	reader         client.Reader
+	queueCounter   queue.Counter
 }
 
-func NewTable(sharedInformerFactory externalversions.SharedInformerFactory, namespace string, counter queue.Counter) (Table, error) {
-	httpScaledObjects := informershttpv1alpha1.New(sharedInformerFactory, namespace, nil).HTTPScaledObjects()
+var _ Table = (*table)(nil)
 
-	t := table{
-		httpScaledObjects: make(map[types.NamespacedName]*httpv1alpha1.HTTPScaledObject),
-		memorySignaler:    util.NewSignaler(),
-	}
-
-	informer, ok := httpScaledObjects.Informer().(sharedIndexInformer)
-	if !ok {
-		return nil, errUnknownSharedIndexInformer
-	}
-	t.httpScaledObjectInformer = informer
-
-	registration, err := informer.AddEventHandler(&t)
-	if err != nil {
-		return nil, err
-	}
-	t.httpScaledObjectEventHandlerRegistration = registration
-	t.queueCounter = counter
-	return &t, nil
-}
-
-func (t *table) runInformer(ctx context.Context) error {
-	if t.httpScaledObjectInformer.HasStarted() {
-		return errStartedSharedIndexInformer
-	}
-
-	t.httpScaledObjectInformer.Run(ctx.Done())
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		return errStoppedSharedIndexInformer
+func NewTable(reader client.Reader, counter queue.Counter) Table {
+	return &table{
+		memorySignaler: util.NewSignaler(),
+		previousKeys:   make(map[string]struct{}),
+		queueCounter:   counter,
+		reader:         reader,
 	}
 }
 
 func (t *table) refreshMemory(ctx context.Context) error {
-	// wait for event handler to be synced before first computation of routes
-	for !t.httpScaledObjectEventHandlerRegistration.HasSynced() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-			continue
-		}
-	}
-
 	for {
-		m := t.newMemoryFromHTTPSOs()
-		t.memoryHolder.Set(m)
+		var irList httpv1beta1.InterceptorRouteList
+		if err := t.reader.List(ctx, &irList); err != nil {
+			return fmt.Errorf("failed to list InterceptorRoutes: %w", err)
+		}
+
+		tm := NewTableMemory()
+		currentKeys := make(map[string]struct{})
+
+		for i := range irList.Items {
+			ir := &irList.Items[i]
+			key := k8s.ResourceKey(ir.Namespace, ir.Name)
+
+			currentKeys[key] = struct{}{}
+
+			tm = tm.Remember(ir)
+
+			t.queueCounter.EnsureKey(key)
+		}
+
+		// TODO(v1): remove the HTTPSO to IR conversion
+		var httpsoList httpv1alpha1.HTTPScaledObjectList
+		if err := t.reader.List(ctx, &httpsoList); err != nil {
+			return fmt.Errorf("listing HTTPScaledObjects: %w", err)
+		}
+
+		for i := range httpsoList.Items {
+			httpso := &httpsoList.Items[i]
+			key := fmt.Sprintf("%s/%s", httpso.Namespace, httpso.Name)
+
+			if _, ok := currentKeys[key]; ok {
+				// skip the conflicting HTTPSO, IR takes precedence
+				continue
+			}
+			currentKeys[key] = struct{}{}
+
+			// Create an IR from the HTTPSO to simplify the whole routing logic
+			ir := &httpv1beta1.InterceptorRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					CreationTimestamp: httpso.CreationTimestamp,
+					Name:              httpso.Name,
+					Namespace:         httpso.Namespace,
+				},
+				Spec: httpv1beta1.InterceptorRouteSpec{
+					Target: httpv1beta1.TargetRef{
+						Port:     httpso.Spec.ScaleTargetRef.Port,
+						PortName: httpso.Spec.ScaleTargetRef.PortName,
+						Service:  httpso.Spec.ScaleTargetRef.Service,
+					},
+				},
+			}
+
+			rr := httpv1beta1.RoutingRule{
+				Hosts: httpso.Spec.Hosts,
+			}
+			for _, pathPrefix := range httpso.Spec.PathPrefixes {
+				rr.Paths = append(rr.Paths, httpv1beta1.PathMatch{
+					Value: pathPrefix,
+				})
+			}
+			for _, header := range httpso.Spec.Headers {
+				rr.Headers = append(rr.Headers, httpv1beta1.HeaderMatch{
+					Name:  header.Name,
+					Value: header.Value,
+				})
+			}
+			ir.Spec.Rules = []httpv1beta1.RoutingRule{rr}
+
+			// Convert HTTPSO timeouts to InterceptorRoute timeouts spec.
+			if httpso.Spec.Timeouts != nil {
+				if httpso.Spec.Timeouts.ConditionWait.Duration > 0 {
+					ir.Spec.Timeouts.Readiness = &metav1.Duration{Duration: httpso.Spec.Timeouts.ConditionWait.Duration}
+				}
+				if httpso.Spec.Timeouts.ResponseHeader.Duration > 0 {
+					ir.Spec.Timeouts.ResponseHeader = &metav1.Duration{Duration: httpso.Spec.Timeouts.ResponseHeader.Duration}
+				}
+			}
+
+			if c := httpso.Spec.ColdStartTimeoutFailoverRef; c != nil {
+				ir.Spec.ColdStart = &httpv1beta1.ColdStartSpec{
+					Fallback: &httpv1beta1.ColdStartFallback{
+						Service: &httpv1beta1.ServiceRef{
+							Name:     c.Service,
+							Port:     c.Port,
+							PortName: c.PortName,
+						},
+					},
+				}
+				if c.TimeoutSeconds > 0 {
+					ir.Spec.Timeouts.Readiness = &metav1.Duration{Duration: time.Duration(c.TimeoutSeconds) * time.Second}
+				}
+			}
+
+			if httpso.Spec.ScalingMetric != nil {
+				if httpso.Spec.ScalingMetric.Concurrency != nil {
+					ir.Spec.ScalingMetric.Concurrency = &httpv1beta1.ConcurrencyTargetSpec{
+						TargetValue: int32(httpso.Spec.ScalingMetric.Concurrency.TargetValue), //nolint:gosec // kubebuilder-validated field, overflow not possible
+					}
+				}
+				if httpso.Spec.ScalingMetric.Rate != nil {
+					ir.Spec.ScalingMetric.RequestRate = &httpv1beta1.RequestRateTargetSpec{
+						TargetValue: int32(httpso.Spec.ScalingMetric.Rate.TargetValue), //nolint:gosec // kubebuilder-validated field, overflow not possible
+						Window:      httpso.Spec.ScalingMetric.Rate.Window,
+						Granularity: httpso.Spec.ScalingMetric.Rate.Granularity,
+					}
+				}
+			}
+
+			tm = tm.Remember(ir)
+
+			t.queueCounter.EnsureKey(key)
+		}
+
+		for key := range t.previousKeys {
+			if _, exists := currentKeys[key]; !exists {
+				t.queueCounter.RemoveKey(key)
+			}
+		}
+		t.previousKeys = currentKeys
+
+		t.memoryHolder.Set(tm)
 
 		if err := t.memorySignaler.Wait(ctx); err != nil {
 			return err
@@ -103,28 +176,15 @@ func (t *table) refreshMemory(ctx context.Context) error {
 	}
 }
 
-func (t *table) newMemoryFromHTTPSOs() *TableMemory {
-	t.httpScaledObjectsMutex.RLock()
-	defer t.httpScaledObjectsMutex.RUnlock()
-
-	tm := NewTableMemory()
-	for _, newHTTPSO := range t.httpScaledObjects {
-		tm = tm.Remember(newHTTPSO)
-	}
-
-	return tm
+func (t *table) Signal() {
+	t.memorySignaler.Signal()
 }
-
-var _ Table = (*table)(nil)
 
 func (t *table) Start(ctx context.Context) error {
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(util.ApplyContext(t.runInformer, ctx))
-	eg.Go(util.ApplyContext(t.refreshMemory, ctx))
-	return eg.Wait()
+	return t.refreshMemory(ctx)
 }
 
-func (t *table) Route(req *http.Request) *httpv1alpha1.HTTPScaledObject {
+func (t *table) Route(req *http.Request) *httpv1beta1.InterceptorRoute {
 	if req == nil || req.URL == nil {
 		return nil
 	}
@@ -144,88 +204,10 @@ func (t *table) HasSynced() bool {
 	return tm != nil
 }
 
-var _ cache.ResourceEventHandler = (*table)(nil)
-
-func (t *table) OnAdd(obj interface{}, _ bool) {
-	httpScaledObject, ok := obj.(*httpv1alpha1.HTTPScaledObject)
-	if !ok {
-		return
-	}
-	key := *k8s.NamespacedNameFromObject(httpScaledObject)
-
-	window := time.Minute
-	granualrity := time.Second
-	if httpScaledObject.Spec.ScalingMetric != nil &&
-		httpScaledObject.Spec.ScalingMetric.Rate != nil {
-		window = httpScaledObject.Spec.ScalingMetric.Rate.Window.Duration
-		granualrity = httpScaledObject.Spec.ScalingMetric.Rate.Granularity.Duration
-	}
-	t.queueCounter.EnsureKey(key.String(), window, granualrity)
-
-	defer t.memorySignaler.Signal()
-
-	t.httpScaledObjectsMutex.Lock()
-	defer t.httpScaledObjectsMutex.Unlock()
-
-	t.httpScaledObjects[key] = httpScaledObject
-}
-
-func (t *table) OnUpdate(oldObj interface{}, newObj interface{}) {
-	oldHTTPSO, ok := oldObj.(*httpv1alpha1.HTTPScaledObject)
-	if !ok {
-		return
-	}
-	oldKey := *k8s.NamespacedNameFromObject(oldHTTPSO)
-
-	newHTTPSO, ok := newObj.(*httpv1alpha1.HTTPScaledObject)
-	if !ok {
-		return
-	}
-	newKey := *k8s.NamespacedNameFromObject(newHTTPSO)
-
-	window := time.Minute
-	granualrity := time.Second
-	if newHTTPSO.Spec.ScalingMetric != nil &&
-		newHTTPSO.Spec.ScalingMetric.Rate != nil {
-		window = newHTTPSO.Spec.ScalingMetric.Rate.Window.Duration
-		granualrity = newHTTPSO.Spec.ScalingMetric.Rate.Granularity.Duration
-	}
-	t.queueCounter.UpdateBuckets(newKey.String(), window, granualrity)
-
-	mustDelete := oldKey != newKey
-	defer t.memorySignaler.Signal()
-
-	t.httpScaledObjectsMutex.Lock()
-	defer t.httpScaledObjectsMutex.Unlock()
-
-	t.httpScaledObjects[newKey] = newHTTPSO
-
-	if mustDelete {
-		delete(t.httpScaledObjects, oldKey)
-		t.queueCounter.RemoveKey(oldKey.String())
-	}
-}
-
-func (t *table) OnDelete(obj interface{}) {
-	httpScaledObject, ok := obj.(*httpv1alpha1.HTTPScaledObject)
-	if !ok {
-		return
-	}
-	key := *k8s.NamespacedNameFromObject(httpScaledObject)
-
-	defer t.memorySignaler.Signal()
-
-	t.httpScaledObjectsMutex.Lock()
-	defer t.httpScaledObjectsMutex.Unlock()
-
-	delete(t.httpScaledObjects, key)
-
-	t.queueCounter.RemoveKey(key.String())
-}
-
 var _ util.HealthChecker = (*table)(nil)
 
 func (t *table) HealthCheck(_ context.Context) error {
+	// TODO: HasSynced never fails after passing once, it is not testing health over time
 	if !t.HasSynced() {
 		return errNotSyncedTable
 	}

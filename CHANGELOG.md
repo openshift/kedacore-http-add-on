@@ -10,6 +10,9 @@ This changelog keeps track of work items that have been completed and are ready 
 ## History
 
 - [Unreleased](#unreleased)
+- [v0.14.0](#v0140)
+- [v0.13.0](#v0130)
+- [v0.12.2](#v0122)
 - [v0.12.1](#v0121)
 - [v0.12.0](#v0120)
 - [v0.11.1](#v0111)
@@ -46,6 +49,74 @@ This changelog keeps track of work items that have been completed and are ready 
 ### Other
 
 - **General**: TODO ([#TODO](https://github.com/kedacore/http-add-on/issues/TODO))
+
+## v0.14.0
+
+### Breaking Changes
+
+- **Interceptor**: Change default timeout behavior: request timeout (`KEDA_HTTP_REQUEST_TIMEOUT`) defaults to `0` (disabled), response header timeout (`KEDA_RESPONSE_HEADER_TIMEOUT` → `KEDA_HTTP_RESPONSE_HEADER_TIMEOUT`) defaults to `300s` (was `500ms`), and readiness timeout (`KEDA_CONDITION_WAIT_TIMEOUT` → `KEDA_HTTP_READINESS_TIMEOUT`) defaults to `0` (disabled, was `20s`). Timeout errors return 504 instead of 502. ([#1474](https://github.com/kedacore/http-add-on/issues/1474))
+- **Interceptor**: Redesign interceptor metrics with bounded labels: `path`/`host` labels replaced by `route_name`/`route_namespace`; non-standard HTTP methods normalized to `_OTHER`; dashboards must be updated ([#1559](https://github.com/kedacore/http-add-on/issues/1559))
+- **Interceptor**: Remove `KEDA_HTTP_TLS_HANDSHAKE_TIMEOUT`, `KEDA_HTTP_EXPECT_CONTINUE_TIMEOUT`, `KEDA_HTTP_KEEP_ALIVE`, `KEDA_HTTP_IDLE_CONN_TIMEOUT`, and `KEDA_HTTP_DIAL_RETRY_TIMEOUT` environment variables; these now use Go's `DefaultTransport` defaults. ([#1474](https://github.com/kedacore/http-add-on/issues/1474))
+- **Interceptor**: Rename interceptor metrics to follow OTel semantic conventions: `interceptor_requests_total` → `interceptor_request_count_total`, `interceptor_pending_requests` → `interceptor_request_concurrency`, `interceptor_request_duration_seconds` unchanged ([#1589](https://github.com/kedacore/http-add-on/issues/1589))
+
+### New
+
+- **General**: Add `InterceptorRoute` CRD to separate routing/interceptor config from scaling config; `HTTPScaledObject` remains supported but will be deprecated in a future release ([#1501](https://github.com/kedacore/http-add-on/issues/1501))
+- **Interceptor**: Add per-route timeout configuration via InterceptorRoute `timeouts` spec with `request`, `responseHeader`, and `readiness` fields. When unset, global env var defaults are used. When a fallback service is configured and no readiness timeout is set, it defaults to 30s. ([#1474](https://github.com/kedacore/http-add-on/issues/1474))
+- **Operator**: Add `httpscaledobject.keda.sh/orphan-scaledobject` annotation to preserve ScaledObjects during HTTPScaledObject-to-InterceptorRoute migration ([#1593](https://github.com/kedacore/http-add-on/issues/1593))
+
+### Improvements
+
+- **Interceptor**: Support `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` for trace sampling configuration ([#1534](https://github.com/kedacore/http-add-on/issues/1534))
+- **Scaler**: Move request-rate calculation from interceptor to scaler for a consistent view of request rate across all interceptor replicas ([#1557](https://github.com/kedacore/http-add-on/issues/1557))
+
+### Fixes
+
+- **Interceptor**: Restrict metrics endpoint to `/metrics` path only, matching the Prometheus scrape convention ([#1591](https://github.com/kedacore/http-add-on/issues/1591))
+
+### Deprecations
+
+- **Interceptor**: Deprecate `KEDA_CONDITION_WAIT_TIMEOUT` and `KEDA_RESPONSE_HEADER_TIMEOUT` environment variables in favor of `KEDA_HTTP_READINESS_TIMEOUT` and `KEDA_HTTP_RESPONSE_HEADER_TIMEOUT`. Old vars take precedence when set and log deprecation warnings. ([#1474](https://github.com/kedacore/http-add-on/issues/1474))
+- **Operator**: Log deprecation warning for HTTPScaledObject resources, guiding users to migrate to InterceptorRoute ([#1595](https://github.com/kedacore/http-add-on/issues/1595))
+
+### Other
+
+- **General**: Remove legacy in-repo documentation in favor of [keda.sh/http-add-on](https://keda.sh/http-add-on/latest/) ([#1516](https://github.com/kedacore/http-add-on/issues/1516))
+
+## v0.13.0
+
+### Breaking Changes
+
+- **Interceptor**: Remove B3 (Zipkin) trace propagation, only W3C TraceContext and W3C Baggage are now supported ([#1519](https://github.com/kedacore/http-add-on/issues/1519))
+
+### Improvements
+
+- **Docs**: Update design doc to use `scalingMetric`/`targetValue` instead of deprecated `targetPendingRequests` ([#1536](https://github.com/kedacore/http-add-on/pull/1536))
+- **Interceptor**: Add env-based TLS configuration for min/max version, cipher suites, and curve preferences ([#1530](https://github.com/kedacore/http-add-on/pull/1530))
+- **Interceptor**: Reduce interceptor latency and memory usage under high concurrency ([#1482](https://github.com/kedacore/http-add-on/pull/1482))
+- **Interceptor**: Speed up endpoint readiness checks with a fast lookup cache ([#1472](https://github.com/kedacore/http-add-on/pull/1472))
+
+### Fixes
+
+- **General**: Fix `roundToNDigits` using `math.Round` instead of `math.Floor` to correctly round small negative floating-point errors to zero ([#1483](https://github.com/kedacore/http-add-on/pull/1483))
+- **Interceptor**: Remove configurable `KEDA_HTTP_ENDPOINTS_CACHE_POLLING_INTERVAL_MS` and hardcode EndpointSlice informer resync to 60m ([#1485](https://github.com/kedacore/http-add-on/pull/1485))
+- **Scaler**: Remove unused `KEDA_HTTP_SCALER_DEPLOYMENT_INFORMER_RSYNC_PERIOD` env var ([#1533](https://github.com/kedacore/http-add-on/pull/1533))
+
+### Other
+
+- **Interceptor**: Remove unused `CurrentNamespace` field and `KEDA_HTTP_CURRENT_NAMESPACE` env var from interceptor config ([#1484](https://github.com/kedacore/http-add-on/pull/1484))
+
+## v0.12.2
+
+### Improvements
+
+- **Interceptor**: Increase default connection pool sizes for higher throughput ([#1469](https://github.com/kedacore/http-add-on/pull/1469))
+
+### Fixes
+
+- **Interceptor**: Fix health probes failing when HTTPScaledObject has no hosts configured ([#1447](https://github.com/kedacore/http-add-on/issues/1447))
+- **Interceptor**: Rework dial retry to tolerate slow Service IP propagation and add `KEDA_HTTP_DIAL_RETRY_TIMEOUT` ([#1449](https://github.com/kedacore/http-add-on/issues/1449))
+- **Interceptor**: Set endpoint informer resync default to 1s to suppress warning ([#1455](https://github.com/kedacore/http-add-on/issues/1455))
 
 ## v0.12.1
 
@@ -101,7 +172,7 @@ None
 
 ### Breaking Changes
 
-- **General**: Migrate from deprecated `v1.Endpoints` to `discoveryv1.EndpointSlices` ([#1297](https://github.com/kedacore/http-add-on/issues/1297)).
+- **General**: Migrate from deprecated `v1.Endpoints` to `discoveryv1.EndpointSlices` ([#1297](https://github.com/kedacore/http-add-on/issues/1297))
 
 ### New
 

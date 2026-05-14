@@ -5,20 +5,19 @@ import (
 	"errors"
 	"strings"
 
-	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 
 	"github.com/kedacore/http-add-on/interceptor/config"
 )
 
-var serviceName = "keda-http-interceptor"
+const serviceName = "keda-http-interceptor"
 
 func SetupOTelSDK(ctx context.Context, tCfg config.Tracing) (shutdown func(context.Context) error, err error) {
 	var shutdownFuncs []func(context.Context) error
@@ -61,8 +60,8 @@ func SetupOTelSDK(ctx context.Context, tCfg config.Tracing) (shutdown func(conte
 
 func newResource(serviceName string) (*resource.Resource, error) {
 	return resource.Merge(resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL,
-			semconv.ServiceName(serviceName),
+		resource.NewSchemaless(
+			attribute.String("service.name", serviceName),
 		))
 }
 
@@ -70,7 +69,6 @@ func NewPropagator() propagation.TextMapPropagator {
 	return propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
-		b3.New(),
 	)
 }
 
@@ -81,7 +79,6 @@ func newTraceProvider(ctx context.Context, res *resource.Resource, tCfg config.T
 	}
 
 	traceProvider := trace.NewTracerProvider(
-		trace.WithSampler(trace.AlwaysSample()),
 		trace.WithBatcher(traceExporter),
 		trace.WithResource(res),
 	)

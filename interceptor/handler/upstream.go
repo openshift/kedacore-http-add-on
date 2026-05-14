@@ -1,36 +1,39 @@
 package handler
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"time"
 
-	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/kedacore/http-add-on/interceptor/config"
+	kedahttp "github.com/kedacore/http-add-on/pkg/http"
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
 var (
 	bufferPool = newBufferPool()
 
-	errNilStream = errors.New("context stream is nil")
+	errNilUpstreamURL = errors.New("upstream URL is nil")
 )
 
 type Upstream struct {
-	roundTripper   http.RoundTripper
-	tracingCfg     config.Tracing
-	shouldFailover bool
+	transportPool         *kedahttp.TransportPool
+	tracingCfg            config.Tracing
+	responseHeaderTimeout time.Duration
 }
 
-func NewUpstream(roundTripper http.RoundTripper, tracingCfg config.Tracing, shouldFailover bool) *Upstream {
+func NewUpstream(baseTransport *http.Transport, tracingCfg config.Tracing, responseHeaderTimeout time.Duration) *Upstream {
 	return &Upstream{
-		roundTripper:   roundTripper,
-		tracingCfg:     tracingCfg,
-		shouldFailover: shouldFailover,
+		transportPool:         kedahttp.NewTransportPool(baseTransport),
+		tracingCfg:            tracingCfg,
+		responseHeaderTimeout: responseHeaderTimeout,
 	}
 }
 
@@ -41,35 +44,45 @@ func (uh *Upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if uh.tracingCfg.Enabled {
-		p := otel.GetTextMapPropagator()
-		ctx = p.Extract(ctx, propagation.HeaderCarrier(r.Header))
-
-		p.Inject(ctx, propagation.HeaderCarrier(w.Header()))
-
 		span := trace.SpanFromContext(ctx)
-		defer span.End()
-
-		serviceValAttr := attribute.String("service", "keda-http-interceptor-proxy-upstream")
-		coldStartValAttr := attribute.String("cold-start", w.Header().Get("X-KEDA-HTTP-Cold-Start"))
-
-		span.SetAttributes(serviceValAttr, coldStartValAttr)
+		span.SetAttributes(
+			attribute.String("service", "keda-http-interceptor-proxy-upstream"),
+			attribute.String("cold-start", w.Header().Get(kedahttp.HeaderColdStart)),
+		)
 	}
 
-	stream := util.StreamFromContext(ctx)
-	if uh.shouldFailover {
-		stream = util.FailoverStreamFromContext(ctx)
-	}
+	url := util.UpstreamURLFromContext(ctx)
 
-	if stream == nil {
-		sh := NewStatic(http.StatusInternalServerError, errNilStream)
+	if url == nil {
+		sh := NewStatic(http.StatusInternalServerError, errNilUpstreamURL)
 		sh.ServeHTTP(w, r)
 
 		return
 	}
 
+	// Select transport with per-route or global response header timeout.
+	responseHeaderTimeout := uh.responseHeaderTimeout
+	if ir := util.InterceptorRouteFromContext(ctx); ir != nil {
+		if ir.Spec.Timeouts.ResponseHeader != nil {
+			responseHeaderTimeout = ir.Spec.Timeouts.ResponseHeader.Duration
+		}
+	}
+
+	transport := uh.transportPool.Get(responseHeaderTimeout)
+
+	var rt http.RoundTripper = transport
+	if uh.tracingCfg.Enabled {
+		rt = otelhttp.NewTransport(transport)
+	}
+
+	rc := http.NewResponseController(w)
+	if err := rc.EnableFullDuplex(); err != nil {
+		util.LoggerFromContext(ctx).Error(err, "could not enable full duplex on response writer, continuing")
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(stream)
+			pr.SetURL(url)
 			// Preserve original Host header (SetURL rewrites it by default).
 			pr.Out.Host = pr.In.Host
 
@@ -84,9 +97,17 @@ func (uh *Upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		BufferPool: bufferPool,
-		Transport:  uh.roundTripper,
+		Transport:  rt,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			sh := NewStatic(http.StatusBadGateway, err)
+			code := http.StatusBadGateway
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				// Respond with 504 Gateway Timeout on timeouts to differentiate from general server errors
+				code = http.StatusGatewayTimeout
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				code = http.StatusGatewayTimeout
+			}
+			sh := NewStatic(code, err)
 			sh.ServeHTTP(w, r)
 		},
 	}

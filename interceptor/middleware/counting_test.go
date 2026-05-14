@@ -1,141 +1,73 @@
 package middleware
 
 import (
-	"context"
-	"fmt"
-	"math"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
-	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
-	httpv1alpha1 "github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
-	"github.com/kedacore/http-add-on/pkg/k8s"
+	"github.com/kedacore/http-add-on/interceptor/metrics"
+	httpv1beta1 "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
 	"github.com/kedacore/http-add-on/pkg/queue"
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
-func TestCountMiddleware(t *testing.T) {
-	r := require.New(t)
-
-	uri, err := url.Parse("https://testingkeda.com")
-	r.NoError(err)
-
-	httpso := &httpv1alpha1.HTTPScaledObject{
+func TestCounting_ConcurrencyTracking(t *testing.T) {
+	ir := &httpv1beta1.InterceptorRoute{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-namespace",
+			Name: "test-route",
 		},
-		Spec: httpv1alpha1.HTTPScaledObjectSpec{
-			ScaleTargetRef: httpv1alpha1.ScaleTargetRef{
-				Name:    "testdepl",
-				Service: "testservice",
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Target: httpv1beta1.TargetRef{
+				Service: "test-svc",
 				Port:    8080,
 			},
-			TargetPendingRequests: ptr.To[int32](123),
 		},
 	}
-	namespacedName := k8s.NamespacedNameFromObject(httpso).String()
+	counter := queue.NewFakeCounterBuffered()
 
-	queueCounter := queue.NewFakeCounter()
-
-	middleware := NewCountingMiddleware(
-		queueCounter,
-		http.HandlerFunc(func(wr http.ResponseWriter, req *http.Request) {
-			wr.WriteHeader(200)
-			_, err := wr.Write([]byte("OK"))
-			r.NoError(err)
-		}),
-	)
-
-	ctx := context.Background()
-
-	// for a valid request, we expect the queue to be modified twice.
-	// once to mark a pending HTTP request, then a second time to remove it.
-	// by the end of both sends, increase1 + decrease1 should be 2
-
-	// run middleware with the host in the request
-	req, err := http.NewRequest("GET", "/something", nil)
-	r.NoError(err)
-	reqCtx := req.Context()
-	reqCtx = util.ContextWithLogger(reqCtx, logr.Discard())
-	reqCtx = util.ContextWithHTTPSO(reqCtx, httpso)
-	req = req.WithContext(reqCtx)
-	req.Host = uri.Host
-
-	agg, respRecorder := expectUpdates(
-		ctx,
-		t,
-		2,
-		middleware,
-		req,
-		queueCounter,
-		func(t *testing.T, hostAndCount queue.HostAndCount) {
-			t.Helper()
-			r := require.New(t)
-			r.Equal(float64(1), math.Abs(float64(hostAndCount.Count)))
-			r.Equal(namespacedName, hostAndCount.Host)
-		},
-	)
-	r.Equal(http.StatusOK, respRecorder.Code)
-	r.Equal(http.StatusText(respRecorder.Code), respRecorder.Body.String())
-	r.Equal(2, agg)
-}
-
-// expectUpdates creates a new httptest.ResponseRecorder, then passes req through
-// the middleware. every time the middleware calls fakeCounter.Resize(), it calls
-// resizeCheckFn with t and the queue.HostCount that represents the resize call
-// that was made. it also maintains an aggregate delta of the counts passed to
-// Resize. If, for example, the following integers were passed to resize over
-// 4 calls: [-1, 1, 1, 2], the aggregate would be -1+1+1+2=3
-//
-// this function returns the aggregate and the httptest.ResponseRecorder that was
-// created and used with the middleware
-func expectUpdates(
-	ctx context.Context,
-	t *testing.T,
-	nResizes int,
-	middleware http.Handler,
-	req *http.Request,
-	fakeCounter *queue.FakeCounter,
-	resizeCheckFn func(*testing.T, queue.HostAndCount),
-) (int, *httptest.ResponseRecorder) {
-	t.Helper()
-	r := require.New(t)
-	const timeout = 1 * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	grp, ctx := errgroup.WithContext(ctx)
-	agg := 0
-	grp.Go(func() error {
-		// we expect the queue to be resized nResizes times
-		for i := 0; i < nResizes; i++ {
-			select {
-			case hostAndCount := <-fakeCounter.ResizedCh:
-				agg += hostAndCount.Count
-				resizeCheckFn(t, hostAndCount)
-			case <-ctx.Done():
-				return fmt.Errorf(
-					"timed out waiting for the count middleware. expected %d resizes, timeout was %s, iteration %d",
-					nResizes,
-					timeout,
-					i,
-				)
-			}
-		}
-		return nil
+	var concurrencyDuringRequest int
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		concurrencyDuringRequest = currentConcurrency(t, counter)
+		w.WriteHeader(http.StatusOK)
 	})
 
-	respRecorder := httptest.NewRecorder()
-	middleware.ServeHTTP(respRecorder, req)
+	mw := NewCounting(next, counter, metrics.NewNoopInstruments())
 
-	r.NoError(grp.Wait())
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := util.ContextWithLogger(req.Context(), logr.Discard())
+	ctx = util.ContextWithInterceptorRoute(ctx, ir)
+	req = req.WithContext(ctx)
 
-	return agg, respRecorder
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, req)
+
+	if got, want := rec.Code, http.StatusOK; got != want {
+		t.Fatalf("status: got %d, want %d", got, want)
+	}
+	if got, want := concurrencyDuringRequest, 1; got != want {
+		t.Fatalf("concurrency during request: got %d, want %d", got, want)
+	}
+	if got, want := currentConcurrency(t, counter), 0; got != want {
+		t.Fatalf("concurrency after request: got %d, want %d", got, want)
+	}
+}
+
+func currentConcurrency(t *testing.T, counter *queue.FakeCounter) int {
+	t.Helper()
+
+	counts, err := counter.Current()
+	if err != nil {
+		t.Fatalf("counter.Current() error: %v", err)
+	}
+	if got, want := len(counts), 1; got != want {
+		t.Fatalf("expected %d counter entry, got %d", want, got)
+	}
+	for _, c := range counts {
+		return c.Concurrency
+	}
+
+	return 0
 }

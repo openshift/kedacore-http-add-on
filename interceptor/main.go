@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
+	_ "net/http/pprof" //nolint:gosec // G108: pprof intentionally exposed, gated by --profiling-addr
 	"os"
 	"runtime"
 	"time"
@@ -15,18 +15,20 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
-	k8sinformers "k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/kedacore/http-add-on/interceptor/config"
 	"github.com/kedacore/http-add-on/interceptor/handler"
 	"github.com/kedacore/http-add-on/interceptor/metrics"
 	"github.com/kedacore/http-add-on/interceptor/tracing"
-	clientset "github.com/kedacore/http-add-on/operator/generated/clientset/versioned"
-	informers "github.com/kedacore/http-add-on/operator/generated/informers/externalversions"
+	"github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
+	"github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
 	"github.com/kedacore/http-add-on/pkg/build"
+	kedacache "github.com/kedacore/http-add-on/pkg/cache"
 	kedahttp "github.com/kedacore/http-add-on/pkg/http"
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	"github.com/kedacore/http-add-on/pkg/queue"
@@ -34,17 +36,16 @@ import (
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
-var (
-	setupLog = ctrl.Log.WithName("setup")
-)
+var setupLog = ctrl.Log.WithName("setup")
 
 // +kubebuilder:rbac:groups=http.keda.sh,resources=httpscaledobjects,verbs=get;list;watch
+// +kubebuilder:rbac:groups=http.keda.sh,resources=interceptorroutes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 
 func main() {
 	defer os.Exit(1)
-	timeoutCfg := config.MustParseTimeouts()
+	timeoutCfg := config.MustParseTimeouts(setupLog)
 	servingCfg := config.MustParseServing()
 	metricsCfg := config.MustParseMetrics()
 	tracingCfg := config.MustParseTracing()
@@ -57,11 +58,6 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if err := config.Validate(servingCfg, timeoutCfg); err != nil {
-		setupLog.Error(err, "invalid configuration")
-		runtime.Goexit()
-	}
-
 	setupLog.Info(
 		"starting interceptor",
 		"timeoutConfig",
@@ -72,46 +68,78 @@ func main() {
 		metricsCfg,
 	)
 
-	proxyPort := servingCfg.ProxyPort
-	adminPort := servingCfg.AdminPort
 	proxyTLSEnabled := servingCfg.ProxyTLSEnabled
 	profilingAddr := servingCfg.ProfilingAddr
 
-	// setup the configured metrics collectors
-	metrics.NewMetricsCollectors(metricsCfg)
-
-	cfg := ctrl.GetConfigOrDie()
-
-	cl, err := kubernetes.NewForConfig(cfg)
+	provider, err := metrics.NewMeterProvider(metricsCfg)
 	if err != nil {
-		setupLog.Error(err, "creating new Kubernetes ClientSet")
+		setupLog.Error(err, "failed to create meter provider")
+		runtime.Goexit()
+	}
+	defer func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			setupLog.Error(err, "error shutting down meter provider")
+		}
+	}()
+
+	instruments, err := metrics.NewInstruments(provider)
+	if err != nil {
+		setupLog.Error(err, "failed to create metric instruments")
 		runtime.Goexit()
 	}
 
-	k8sSharedInformerFactory := k8sinformers.NewSharedInformerFactory(cl, time.Millisecond*time.Duration(servingCfg.EndpointsCachePollIntervalMS))
-	svcCache := k8s.NewInformerBackedServiceCache(ctrl.Log, cl, k8sSharedInformerFactory)
-	endpointsCache := k8s.NewInformerBackedEndpointsCache(ctrl.Log, cl, time.Millisecond*time.Duration(servingCfg.EndpointsCachePollIntervalMS))
-	waitFunc := newWorkloadReplicasForwardWaitFunc(ctrl.Log, endpointsCache)
+	cfg := ctrl.GetConfigOrDie()
 
-	httpCl, err := clientset.NewForConfig(cfg)
+	ctx := ctrl.SetupSignalHandler()
+	ctx = util.ContextWithLogger(ctx, ctrl.Log)
+
+	cacheOpts := cache.Options{
+		Scheme:     kedacache.NewScheme(),
+		SyncPeriod: &servingCfg.CacheSyncPeriod,
+	}
+	if servingCfg.WatchNamespace != "" {
+		cacheOpts.DefaultNamespaces = map[string]cache.Config{
+			servingCfg.WatchNamespace: {},
+		}
+	}
+
+	ctrlCache, err := cache.New(cfg, cacheOpts)
 	if err != nil {
-		setupLog.Error(err, "creating new HTTP ClientSet")
+		setupLog.Error(err, "creating cache")
+		runtime.Goexit()
+	}
+
+	readyCache, err := k8s.NewReadyEndpointsCacheWithInformer(ctx, ctrl.Log, ctrlCache)
+	if err != nil {
+		setupLog.Error(err, "creating endpoints cache")
 		runtime.Goexit()
 	}
 
 	queues := queue.NewMemory()
+	routingTable := routing.NewTable(ctrlCache, queues)
 
-	sharedInformerFactory := informers.NewSharedInformerFactory(httpCl, servingCfg.ConfigMapCacheRsyncPeriod)
-	routingTable, err := routing.NewTable(sharedInformerFactory, servingCfg.WatchNamespace, queues)
-	if err != nil {
-		setupLog.Error(err, "fetching routing table")
-		runtime.Goexit()
+	// Setup informers to signal routing table on IR and HTTPSO changes
+	routeSources := []client.Object{&v1beta1.InterceptorRoute{}, &v1alpha1.HTTPScaledObject{}}
+
+	for _, obj := range routeSources {
+		informer, err := ctrlCache.GetInformer(ctx, obj)
+		if err != nil {
+			setupLog.Error(err, "getting informer", "type", fmt.Sprintf("%T", obj))
+			runtime.Goexit()
+		}
+
+		_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+			AddFunc:    func(_ any) { routingTable.Signal() },
+			UpdateFunc: func(_, _ any) { routingTable.Signal() },
+			DeleteFunc: func(_ any) { routingTable.Signal() },
+		})
+		if err != nil {
+			setupLog.Error(err, "adding event handlers")
+			runtime.Goexit()
+		}
 	}
 
 	setupLog.Info("Interceptor starting")
-
-	ctx := ctrl.SetupSignalHandler()
-	ctx = util.ContextWithLogger(ctx, ctrl.Log)
 
 	eg, ctx := errgroup.WithContext(ctx)
 
@@ -129,18 +157,18 @@ func main() {
 		}()
 	}
 
-	// start the endpoints cache updater
 	eg.Go(func() error {
-		setupLog.Info("starting the endpoints cache")
-
-		endpointsCache.Start(ctx)
-		k8sSharedInformerFactory.Start(ctx.Done())
-		return nil
+		setupLog.Info("starting the controller-runtime cache")
+		return ctrlCache.Start(ctx)
 	})
 
-	// start the update loop that updates the routing table from
-	// the ConfigMap that the operator updates as HTTPScaledObjects
-	// enter and exit the system
+	// Wait for cache to sync before starting components that depend on it
+	if !ctrlCache.WaitForCacheSync(ctx) {
+		setupLog.Error(nil, "cache failed to sync")
+		runtime.Goexit()
+	}
+
+	// Start the update loop that refreshes the routing table on InterceptorRoute & HTTPSO changes
 	eg.Go(func() error {
 		setupLog.Info("starting the routing table")
 
@@ -155,9 +183,9 @@ func main() {
 	// start the administrative server. this is the server
 	// that serves the queue size API
 	eg.Go(func() error {
-		setupLog.Info("starting the admin server", "port", adminPort)
+		setupLog.Info("starting the admin server", "port", servingCfg.AdminPort)
 
-		if err := runAdminServer(ctx, ctrl.Log, queues, adminPort); !util.IsIgnoredErr(err) {
+		if err := runAdminServer(ctx, ctrl.Log, servingCfg.AdminPort, queues, routingTable); !util.IsIgnoredErr(err) {
 			setupLog.Error(err, "admin server failed")
 			return err
 		}
@@ -188,19 +216,21 @@ func main() {
 				KeyPath:            servingCfg.TLSKeyPath,
 				CertStorePaths:     servingCfg.TLSCertStorePaths,
 				InsecureSkipVerify: servingCfg.TLSSkipVerify,
+				MinTLSVersion:      servingCfg.TLSMinVersion,
+				MaxTLSVersion:      servingCfg.TLSMaxVersion,
+				CipherSuites:       servingCfg.TLSCipherSuites,
+				CurvePreferences:   servingCfg.TLSCurvePreferences,
 			}, setupLog)
-
 			if err != nil {
 				setupLog.Error(err, "failed to configure TLS")
 				return fmt.Errorf("failed to configure TLS: %w", err)
 			}
 
 			proxyTLSPort := servingCfg.TLSPort
-			k8sSharedInformerFactory.WaitForCacheSync(ctx.Done())
 
 			setupLog.Info("starting the proxy server with TLS enabled", "port", proxyTLSPort)
 
-			if err := runProxyServer(ctx, ctrl.Log, queues, waitFunc, routingTable, svcCache, timeoutCfg, servingCfg, proxyTLSPort, tlsCfg, tracingCfg); !util.IsIgnoredErr(err) {
+			if err := runProxyServer(ctx, ctrl.Log, queues, readyCache, routingTable, ctrlCache, timeoutCfg, servingCfg, proxyTLSPort, tlsCfg, tracingCfg, instruments); !util.IsIgnoredErr(err) {
 				setupLog.Error(err, "tls proxy server failed")
 				return err
 			}
@@ -210,10 +240,9 @@ func main() {
 
 	// start a proxy server without TLS.
 	eg.Go(func() error {
-		k8sSharedInformerFactory.WaitForCacheSync(ctx.Done())
-		setupLog.Info("starting the proxy server with TLS disabled", "port", proxyPort)
+		setupLog.Info("starting the proxy server with TLS disabled", "port", servingCfg.ProxyPort)
 
-		if err := runProxyServer(ctx, ctrl.Log, queues, waitFunc, routingTable, svcCache, timeoutCfg, servingCfg, proxyPort, nil, tracingCfg); !util.IsIgnoredErr(err) {
+		if err := runProxyServer(ctx, ctrl.Log, queues, readyCache, routingTable, ctrlCache, timeoutCfg, servingCfg, servingCfg.ProxyPort, nil, tracingCfg, instruments); !util.IsIgnoredErr(err) {
 			setupLog.Error(err, "proxy server failed")
 			return err
 		}
@@ -224,7 +253,11 @@ func main() {
 	if len(profilingAddr) > 0 {
 		eg.Go(func() error {
 			setupLog.Info("enabling pprof for profiling", "address", profilingAddr)
-			return http.ListenAndServe(profilingAddr, nil)
+			srv := &http.Server{
+				Addr:              profilingAddr,
+				ReadHeaderTimeout: time.Minute, // mitigate Slowloris attacks
+			}
+			return srv.ListenAndServe()
 		})
 	}
 
@@ -241,62 +274,60 @@ func main() {
 func runAdminServer(
 	ctx context.Context,
 	lggr logr.Logger,
-	q queue.Counter,
 	port int,
+	q queue.Counter,
+	routingTable routing.Table,
 ) error {
 	lggr = lggr.WithName("runAdminServer")
-	adminServer := http.NewServeMux()
-	queue.AddCountsRoute(
-		lggr,
-		adminServer,
-		q,
-	)
+
+	probeHandler := handler.NewProbe(routingTable)
+	go probeHandler.Start(ctx)
+
+	adminHandler := BuildAdminHandler(lggr, q, probeHandler)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	lggr.Info("admin server starting", "address", addr)
-	return kedahttp.ServeContext(ctx, addr, adminServer, nil)
+	return kedahttp.ServeContext(ctx, addr, adminHandler, nil)
 }
 
 func runMetricsServer(
 	ctx context.Context,
 	lggr logr.Logger,
-	metricsCfg *config.Metrics,
+	metricsCfg config.Metrics,
 ) error {
 	lggr.Info("starting the prometheus metrics server", "port", metricsCfg.OtelPrometheusExporterPort, "path", "/metrics")
 	addr := fmt.Sprintf("0.0.0.0:%d", metricsCfg.OtelPrometheusExporterPort)
-	return kedahttp.ServeContext(ctx, addr, promhttp.Handler(), nil)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	return kedahttp.ServeContext(ctx, addr, mux, nil)
 }
 
 func runProxyServer(
 	ctx context.Context,
 	logger logr.Logger,
 	q queue.Counter,
-	waitFunc forwardWaitFunc,
+	readyCache *k8s.ReadyEndpointsCache,
 	routingTable routing.Table,
-	svcCache k8s.ServiceCache,
+	reader client.Reader,
 	timeouts config.Timeouts,
 	serving config.Serving,
 	port int,
 	tlsCfg *tls.Config,
 	tracingConfig config.Tracing,
+	instruments *metrics.Instruments,
 ) error {
-	probeHandler := handler.NewProbe([]util.HealthChecker{
-		routingTable,
-	})
-	go probeHandler.Start(ctx)
-
 	// Build handler chain using the shared builder
 	rootHandler := BuildProxyHandler(&ProxyHandlerConfig{
 		Logger:       logger,
 		Queue:        q,
-		WaitFunc:     waitFunc,
+		ReadyCache:   readyCache,
 		RoutingTable: routingTable,
-		ProbeHandler: probeHandler,
-		ServiceCache: svcCache,
+		Reader:       reader,
 		Timeouts:     timeouts,
 		Serving:      serving,
 		TLSConfig:    tlsCfg,
 		Tracing:      tracingConfig,
+		Instruments:  instruments,
 	})
 
 	addr := fmt.Sprintf("0.0.0.0:%d", port)

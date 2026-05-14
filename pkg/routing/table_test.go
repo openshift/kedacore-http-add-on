@@ -2,293 +2,616 @@ package routing
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"reflect"
+	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	"go.uber.org/mock/gomock"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	httpv1alpha1 "github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
-	clientsetmock "github.com/kedacore/http-add-on/operator/generated/clientset/versioned/mock"
-	clientsethttpv1alpha1mock "github.com/kedacore/http-add-on/operator/generated/clientset/versioned/typed/http/v1alpha1/mock"
-	informersexternalversions "github.com/kedacore/http-add-on/operator/generated/informers/externalversions"
-	"github.com/kedacore/http-add-on/pkg/k8s"
+	httpv1beta1 "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
+	kedacache "github.com/kedacore/http-add-on/pkg/cache"
 	"github.com/kedacore/http-add-on/pkg/queue"
-	"github.com/kedacore/http-add-on/pkg/util"
 )
 
-var _ = Describe("Table", func() {
-	const (
-		namespace = "default"
-	)
+func newTestClient(objs ...client.Object) client.Client {
+	return fake.NewClientBuilder().
+		WithScheme(kedacache.NewScheme()).
+		WithObjects(objs...).
+		Build()
+}
 
-	var (
-		ctrl                  *gomock.Controller
-		watcher               *watch.FakeWatcher
-		httpsoCl              *clientsethttpv1alpha1mock.MockHTTPScaledObjectInterface
-		sharedInformerFactory informersexternalversions.SharedInformerFactory
+func startTableAndWaitForSync(t *testing.T, tbl Table) context.CancelFunc {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
 
-		ctx        = context.Background()
-		httpsoList = httpv1alpha1.HTTPScaledObjectList{
-			Items: []httpv1alpha1.HTTPScaledObject{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: namespace,
-						Name:      "keda-sh",
-					},
-					Spec: httpv1alpha1.HTTPScaledObjectSpec{
-						Hosts: []string{
-							"keda.sh",
-						},
-					},
+	go func() {
+		_ = tbl.Start(ctx)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if tbl.HasSynced() {
+			return cancel
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	t.Fatal("table did not sync within timeout")
+	return cancel
+}
+
+func TestTableRoute_NilRequest(t *testing.T) {
+	cl := newTestClient()
+	tbl := NewTable(cl, queue.NewMemory())
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	result := tbl.Route(nil)
+	if result != nil {
+		t.Error("expected nil for nil request")
+	}
+}
+
+func TestTableRoute(t *testing.T) {
+	first := &httpv1beta1.InterceptorRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "default"},
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Rules: []httpv1beta1.RoutingRule{{Hosts: []string{"first.example.com"}}},
+		},
+	}
+	second := &httpv1beta1.InterceptorRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "default"},
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Rules: []httpv1beta1.RoutingRule{{Hosts: []string{"second.example.com"}}},
+		},
+	}
+
+	tests := map[string][]*httpv1beta1.InterceptorRoute{
+		"single host":    {first},
+		"multiple hosts": {first, second},
+	}
+
+	for name, irs := range tests {
+		t.Run(name, func(t *testing.T) {
+			objs := make([]client.Object, len(irs))
+			for i, ir := range irs {
+				objs[i] = ir
+			}
+
+			cl := newTestClient(objs...)
+			tbl := NewTable(cl, queue.NewMemory())
+
+			cancel := startTableAndWaitForSync(t, tbl)
+			defer cancel()
+
+			for _, ir := range irs {
+				host := ir.Spec.Rules[0].Hosts[0]
+				req, _ := http.NewRequest("GET", "http://"+host+"/test", nil)
+				if result := tbl.Route(req); result == nil || result.Name != ir.Name {
+					t.Errorf("host %q: expected %q, got %v", host, ir.Name, result)
+				}
+			}
+
+			unknownReq, _ := http.NewRequest("GET", "http://unknown.example.com/test", nil)
+			if tbl.Route(unknownReq) != nil {
+				t.Error("expected nil for unknown host")
+			}
+		})
+	}
+}
+
+func TestTableHasSynced(t *testing.T) {
+	cl := newTestClient()
+	tbl := NewTable(cl, queue.NewMemory())
+
+	// Initially not synced
+	if tbl.HasSynced() {
+		t.Error("expected HasSynced to be false initially")
+	}
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Now synced
+	if !tbl.HasSynced() {
+		t.Error("expected HasSynced to be true after sync")
+	}
+}
+
+func TestTableHealthCheck(t *testing.T) {
+	cl := newTestClient()
+	tbl := NewTable(cl, queue.NewMemory())
+
+	ctx := context.Background()
+
+	// Initially not synced, health check should fail
+	err := tbl.HealthCheck(ctx)
+	if err == nil {
+		t.Error("expected error when not synced")
+	}
+	if !errors.Is(err, errNotSyncedTable) {
+		t.Errorf("expected errNotSyncedTable, got: %v", err)
+	}
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Now healthy
+	err = tbl.HealthCheck(ctx)
+	if err != nil {
+		t.Errorf("expected no error when synced, got: %v", err)
+	}
+}
+
+func TestTableSignal_TriggersRefresh(t *testing.T) {
+	ir := &httpv1beta1.InterceptorRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "initial", Namespace: "default"},
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Rules: []httpv1beta1.RoutingRule{{Hosts: []string{"initial.example.com"}}},
+		},
+	}
+
+	cl := newTestClient(ir)
+	tbl := NewTable(cl, queue.NewMemory())
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Verify initial routing works
+	req, _ := http.NewRequest("GET", "http://initial.example.com/test", nil)
+	result := tbl.Route(req)
+	if result == nil || result.Name != "initial" {
+		t.Fatal("expected to route to 'initial'")
+	}
+
+	// Add a new object directly to the fake client
+	newIR := &httpv1beta1.InterceptorRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "new-object", Namespace: "default"},
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Rules: []httpv1beta1.RoutingRule{{Hosts: []string{"new.example.com"}}},
+		},
+	}
+	if err := cl.Create(context.Background(), newIR); err != nil {
+		t.Fatalf("failed to create InterceptorRoute: %v", err)
+	}
+
+	// Signal to trigger refresh
+	tbl.Signal()
+
+	// Wait for the new object to be picked up
+	deadline := time.Now().Add(5 * time.Second)
+	var newResult *httpv1beta1.InterceptorRoute
+	newReq, _ := http.NewRequest("GET", "http://new.example.com/test", nil)
+	for time.Now().Before(deadline) {
+		newResult = tbl.Route(newReq)
+		if newResult != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if newResult == nil {
+		t.Fatal("expected to route to new object after Signal")
+	}
+	if newResult.Name != "new-object" {
+		t.Errorf("expected name 'new-object', got %q", newResult.Name)
+	}
+}
+
+func TestTableRefreshMemory_CancelsOnContextDone(t *testing.T) {
+	cl := newTestClient()
+	tbl := NewTable(cl, queue.NewMemory())
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tbl.Start(ctx)
+	}()
+
+	// Wait for initial sync
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if tbl.HasSynced() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Cancel context
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("refreshMemory did not exit after context cancellation")
+	}
+}
+
+func TestTableQueueCounterIntegration(t *testing.T) {
+	ir := &httpv1beta1.InterceptorRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-ir", Namespace: "default"},
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Rules: []httpv1beta1.RoutingRule{{Hosts: []string{"example.com"}}},
+			ScalingMetric: httpv1beta1.ScalingMetricSpec{
+				RequestRate: &httpv1beta1.RequestRateTargetSpec{
+					Window:      metav1.Duration{Duration: 2 * time.Minute},
+					Granularity: metav1.Duration{Duration: 2 * time.Second},
 				},
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: namespace,
-						Name:      "kubernetes-io",
-					},
-					Spec: httpv1alpha1.HTTPScaledObjectSpec{
-						Hosts: []string{
-							"kubernetes.io",
-						},
-						TargetPendingRequests: ptr.To[int32](1),
-					},
-				},
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: namespace,
-						Name:      "github-com",
-					},
-					Spec: httpv1alpha1.HTTPScaledObjectSpec{
-						Hosts: []string{
-							"github.com",
-						},
-						Replicas: &httpv1alpha1.ReplicaStruct{
-							Min: ptr.To[int32](3),
-						},
+			},
+		},
+	}
+
+	cl := newTestClient(ir)
+	counter := queue.NewMemory()
+	tbl := NewTable(cl, counter)
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	key := "default/test-ir"
+	counts, err := counter.Current()
+	if err != nil {
+		t.Fatalf("failed to get current counts: %v", err)
+	}
+	if _, exists := counts[key]; !exists {
+		t.Errorf("expected queue counter to have key %q", key)
+	}
+}
+
+func TestTableSignal_DeletedObjectBecomesUnroutable(t *testing.T) {
+	ir := &httpv1beta1.InterceptorRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "to-delete", Namespace: "default"},
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Rules: []httpv1beta1.RoutingRule{{Hosts: []string{"delete.example.com"}}},
+		},
+	}
+
+	cl := newTestClient(ir)
+	counter := queue.NewMemory()
+	tbl := NewTable(cl, counter)
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Verify initial routing works
+	req, _ := http.NewRequest("GET", "http://delete.example.com/test", nil)
+	result := tbl.Route(req)
+	if result == nil || result.Name != "to-delete" {
+		t.Fatal("expected to route to 'to-delete'")
+	}
+
+	// Verify key exists in counter
+	key := "default/to-delete"
+	counts, err := counter.Current()
+	if err != nil {
+		t.Fatalf("failed to get current counts: %v", err)
+	}
+	if _, exists := counts[key]; !exists {
+		t.Fatalf("expected queue counter to have key %q before deletion", key)
+	}
+
+	// Delete the object
+	if err := cl.Delete(context.Background(), ir); err != nil {
+		t.Fatalf("failed to delete InterceptorRoute: %v", err)
+	}
+
+	// Signal to trigger refresh
+	tbl.Signal()
+
+	// Wait for the deletion to be picked up
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if tbl.Route(req) == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify object is no longer routable
+	if tbl.Route(req) != nil {
+		t.Error("expected deleted object to be unroutable")
+	}
+
+	// Verify key was removed from counter
+	counts, err = counter.Current()
+	if err != nil {
+		t.Fatalf("failed to get current counts: %v", err)
+	}
+	if _, exists := counts[key]; exists {
+		t.Errorf("expected queue counter to NOT have key %q after deletion", key)
+	}
+}
+
+func TestTableRouteHTTPSO(t *testing.T) {
+	first := &httpv1alpha1.HTTPScaledObject{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "default"},
+		Spec:       httpv1alpha1.HTTPScaledObjectSpec{Hosts: []string{"first.example.com"}},
+	}
+	second := &httpv1alpha1.HTTPScaledObject{
+		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "default"},
+		Spec:       httpv1alpha1.HTTPScaledObjectSpec{Hosts: []string{"second.example.com"}},
+	}
+
+	tests := map[string][]*httpv1alpha1.HTTPScaledObject{
+		"single host":    {first},
+		"multiple hosts": {first, second},
+	}
+
+	for name, httpsos := range tests {
+		t.Run(name, func(t *testing.T) {
+			objs := make([]client.Object, len(httpsos))
+			for i, h := range httpsos {
+				objs[i] = h
+			}
+
+			cl := newTestClient(objs...)
+			tbl := NewTable(cl, queue.NewMemory())
+
+			cancel := startTableAndWaitForSync(t, tbl)
+			defer cancel()
+
+			for _, httpso := range httpsos {
+				host := httpso.Spec.Hosts[0]
+				req, _ := http.NewRequest("GET", "http://"+host+"/test", nil)
+				if result := tbl.Route(req); result == nil || result.Name != httpso.Name {
+					t.Errorf("host %q: expected %q, got %v", host, httpso.Name, result)
+				}
+			}
+
+			unknownReq, _ := http.NewRequest("GET", "http://unknown.example.com/test", nil)
+			if tbl.Route(unknownReq) != nil {
+				t.Error("expected nil for unknown host")
+			}
+		})
+	}
+}
+
+func TestTableSignalHTTPSO_TriggersRefresh(t *testing.T) {
+	httpso := &httpv1alpha1.HTTPScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "initial",
+			Namespace: "default",
+		},
+		Spec: httpv1alpha1.HTTPScaledObjectSpec{
+			Hosts: []string{"initial.example.com"},
+		},
+	}
+
+	cl := newTestClient(httpso)
+	tbl := NewTable(cl, queue.NewMemory())
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Verify initial routing works
+	req, _ := http.NewRequest("GET", "http://initial.example.com/test", nil)
+	result := tbl.Route(req)
+	if result == nil || result.Name != "initial" {
+		t.Fatal("expected to route to 'initial'")
+	}
+
+	// Add a new object directly to the fake client
+	newHTTPSO := &httpv1alpha1.HTTPScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "new-object",
+			Namespace: "default",
+		},
+		Spec: httpv1alpha1.HTTPScaledObjectSpec{
+			Hosts: []string{"new.example.com"},
+		},
+	}
+	if err := cl.Create(context.Background(), newHTTPSO); err != nil {
+		t.Fatalf("failed to create new HTTPScaledObject: %v", err)
+	}
+
+	// Signal to trigger refresh
+	tbl.Signal()
+
+	// Wait for the new object to be picked up
+	deadline := time.Now().Add(5 * time.Second)
+	var newResult *httpv1beta1.InterceptorRoute
+	newReq, _ := http.NewRequest("GET", "http://new.example.com/test", nil)
+	for time.Now().Before(deadline) {
+		newResult = tbl.Route(newReq)
+		if newResult != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if newResult == nil {
+		t.Fatal("expected to route to new object after Signal")
+	}
+	if newResult.Name != "new-object" {
+		t.Errorf("expected name 'new-object', got %q", newResult.Name)
+	}
+}
+
+func TestTableHTTPSOTimeoutConversion(t *testing.T) {
+	tests := map[string]struct {
+		httpso         *httpv1alpha1.HTTPScaledObject
+		wantReadiness  *metav1.Duration
+		wantRespHeader *metav1.Duration
+	}{
+		"conditionWait and responseHeader": {
+			httpso: &httpv1alpha1.HTTPScaledObject{
+				ObjectMeta: metav1.ObjectMeta{Name: "timeouts", Namespace: "default"},
+				Spec: httpv1alpha1.HTTPScaledObjectSpec{
+					Hosts: []string{"timeouts.example.com"},
+					Timeouts: &httpv1alpha1.HTTPScaledObjectTimeoutsSpec{
+						ConditionWait:  metav1.Duration{Duration: 30 * time.Second},
+						ResponseHeader: metav1.Duration{Duration: 10 * time.Second},
 					},
 				},
 			},
-		}
-	)
-
-	BeforeEach(func() {
-		ctrl = gomock.NewController(GinkgoT())
-
-		watcher = watch.NewFake()
-
-		httpsoCl = clientsethttpv1alpha1mock.NewMockHTTPScaledObjectInterface(ctrl)
-		httpsoCl.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&httpsoList, nil).
-			AnyTimes()
-		httpsoCl.EXPECT().
-			Watch(gomock.Any(), gomock.Any()).
-			Return(watcher, nil).
-			AnyTimes()
-
-		httpv1alpha1 := clientsethttpv1alpha1mock.NewMockHttpV1alpha1Interface(ctrl)
-		httpv1alpha1.EXPECT().
-			HTTPScaledObjects(namespace).
-			Return(httpsoCl).
-			AnyTimes()
-
-		clientset := clientsetmock.NewMockInterface(ctrl)
-		clientset.EXPECT().
-			HttpV1alpha1().
-			Return(httpv1alpha1).
-			AnyTimes()
-
-		sharedInformerFactory = informersexternalversions.NewSharedInformerFactory(clientset, 0)
-	})
-
-	AfterEach(func() {
-		ctrl.Finish()
-	})
-
-	Context("New", func() {
-		It("returns a table with fields initialized", func() {
-			i, err := NewTable(sharedInformerFactory, namespace, queue.NewFakeCounter())
-			Expect(err).NotTo(HaveOccurred())
-			Expect(i).NotTo(BeNil())
-
-			t, ok := i.(*table)
-			Expect(ok).To(BeTrue())
-			Expect(t.httpScaledObjectInformer).NotTo(BeNil())
-			Expect(t.httpScaledObjectEventHandlerRegistration).NotTo(BeNil())
-			Expect(t.httpScaledObjects).NotTo(BeNil())
-			Expect(t.memorySignaler).NotTo(BeNil())
-
-			// TODO(pedrotorres): mock to check registration
-			// TODO(pedrotorres): refactor to check namespace
-		})
-
-		// TODO(pedrotorres): test code path where informer is not sharedIndexInformer
-		// TODO(pedrotorres): test code path where informer#AddEventHandler fails
-	})
-
-	Context("runInformer", func() {
-		var (
-			t *table
-		)
-
-		BeforeEach(func() {
-			i, _ := NewTable(sharedInformerFactory, namespace, queue.NewFakeCounter())
-			t = i.(*table)
-		})
-
-		It("starts shared informer factory", func() {
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			go util.IgnoringError(util.ApplyContext(t.runInformer, ctx))
-
-			time.Sleep(time.Second)
-
-			b := t.httpScaledObjectInformer.HasStarted()
-			Expect(b).To(BeTrue())
-		})
-
-		It("returns when context is done", func() {
-			ctx, cancel := context.WithCancel(ctx)
-			cancel()
-
-			err := util.WithTimeout(time.Second, util.ApplyContext(t.runInformer, ctx))
-			Expect(err).To(MatchError(context.Canceled))
-		})
-
-		It("returns when informer has already started", func() {
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			go t.httpScaledObjectInformer.Run(ctx.Done())
-
-			time.Sleep(time.Second)
-
-			err := util.WithTimeout(time.Second, util.ApplyContext(t.runInformer, ctx))
-			Expect(err).To(MatchError(errStartedSharedIndexInformer))
-		})
-
-		// TODO(pedrotorres): test code path where informer stops
-	})
-
-	Context("refreshMemory", func() {
-		var (
-			t *table
-		)
-
-		BeforeEach(func() {
-			i, _ := NewTable(sharedInformerFactory, namespace, queue.NewFakeCounter())
-			t = i.(*table)
-		})
-
-		It("refreshes memory on first iteration", func() {
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			for _, httpso := range httpsoList.Items {
-				key := *k8s.NamespacedNameFromObject(&httpso)
-				t.httpScaledObjects[key] = &httpso
-			}
-
-			go util.IgnoringError(util.ApplyContext(t.runInformer, ctx))
-			go util.IgnoringError(util.ApplyContext(t.refreshMemory, ctx))
-
-			time.Sleep(2 * time.Second)
-
-			tm := t.memoryHolder.Get()
-			Expect(tm).NotTo(BeNil())
-
-			for _, httpso := range httpsoList.Items {
-				ret := tm.Route(httpso.Spec.Hosts[0], "", nil)
-				Expect(ret).To(Equal(&httpso))
-			}
-		})
-
-		It("refreshes memory after signal", func() {
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			for _, httpso := range httpsoList.Items {
-				key := *k8s.NamespacedNameFromObject(&httpso)
-				t.httpScaledObjects[key] = &httpso
-			}
-
-			go util.IgnoringError(util.ApplyContext(t.runInformer, ctx))
-			go util.IgnoringError(util.ApplyContext(t.refreshMemory, ctx))
-
-			time.Sleep(2 * time.Second)
-
-			httpso := httpv1alpha1.HTTPScaledObject{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace,
-					Name:      "azure-com",
-				},
+			wantReadiness:  &metav1.Duration{Duration: 30 * time.Second},
+			wantRespHeader: &metav1.Duration{Duration: 10 * time.Second},
+		},
+		"coldStartTimeoutFailoverRef overrides readiness": {
+			httpso: &httpv1alpha1.HTTPScaledObject{
+				ObjectMeta: metav1.ObjectMeta{Name: "coldstart", Namespace: "default"},
 				Spec: httpv1alpha1.HTTPScaledObjectSpec{
-					Hosts: []string{
-						"azure.com",
+					Hosts: []string{"coldstart.example.com"},
+					Timeouts: &httpv1alpha1.HTTPScaledObjectTimeoutsSpec{
+						ConditionWait: metav1.Duration{Duration: 30 * time.Second},
 					},
-					Replicas: &httpv1alpha1.ReplicaStruct{
-						Min: ptr.To[int32](3),
+					ColdStartTimeoutFailoverRef: &httpv1alpha1.ColdStartTimeoutFailoverRef{
+						Service:        "fallback-svc",
+						Port:           8080,
+						TimeoutSeconds: 45,
 					},
 				},
-			}
-			t.httpScaledObjects[*k8s.NamespacedNameFromObject(&httpso)] = &httpso
+			},
+			// ColdStartTimeoutFailoverRef.TimeoutSeconds takes precedence over ConditionWait
+			wantReadiness:  &metav1.Duration{Duration: 45 * time.Second},
+			wantRespHeader: nil,
+		},
+		"no timeouts set": {
+			httpso: &httpv1alpha1.HTTPScaledObject{
+				ObjectMeta: metav1.ObjectMeta{Name: "no-timeouts", Namespace: "default"},
+				Spec: httpv1alpha1.HTTPScaledObjectSpec{
+					Hosts: []string{"no-timeouts.example.com"},
+				},
+			},
+			wantReadiness:  nil,
+			wantRespHeader: nil,
+		},
+	}
 
-			first := httpsoList.Items[0]
-			delete(t.httpScaledObjects, *k8s.NamespacedNameFromObject(&first))
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cl := newTestClient(tc.httpso)
+			tbl := NewTable(cl, queue.NewMemory())
 
-			t.memorySignaler.Signal()
+			cancel := startTableAndWaitForSync(t, tbl)
+			defer cancel()
 
-			time.Sleep(time.Second)
-
-			tm := t.memoryHolder.Get()
-			Expect(tm).NotTo(BeNil())
-
-			for _, httpso := range append(httpsoList.Items[1:], httpso) {
-				ret := tm.Route(httpso.Spec.Hosts[0], "", nil)
-				Expect(ret).To(Equal(&httpso))
-			}
-
-			// First item was deleted, should not be routable
-			ret := tm.Route(first.Spec.Hosts[0], "", nil)
-			Expect(ret).To(BeNil())
-		})
-
-		It("returns when context is done", func() {
-			ctx, cancel := context.WithCancel(ctx)
-			cancel()
-
-			err := util.WithTimeout(time.Second, util.ApplyContext(t.refreshMemory, ctx))
-			Expect(err).To(MatchError(context.Canceled))
-		})
-	})
-
-	Context("newMemoryFromHTTPSOs", func() {
-		var (
-			t *table
-		)
-
-		BeforeEach(func() {
-			i, _ := NewTable(sharedInformerFactory, namespace, queue.NewFakeCounter())
-			t = i.(*table)
-		})
-
-		It("returns new memory based on HTTPSOs", func() {
-			for _, httpso := range httpsoList.Items {
-				key := *k8s.NamespacedNameFromObject(&httpso)
-				t.httpScaledObjects[key] = &httpso
+			host := tc.httpso.Spec.Hosts[0]
+			req, _ := http.NewRequest("GET", "http://"+host+"/test", nil)
+			result := tbl.Route(req)
+			if result == nil {
+				t.Fatal("expected route to be found")
 			}
 
-			tm := t.newMemoryFromHTTPSOs()
-
-			for _, httpso := range httpsoList.Items {
-				ret := tm.Route(httpso.Spec.Hosts[0], "", nil)
-				Expect(ret).To(Equal(&httpso))
+			if got, want := result.Spec.Timeouts.Readiness, tc.wantReadiness; !reflect.DeepEqual(got, want) {
+				t.Errorf("readiness timeout: got %v, want %v", got, want)
+			}
+			if got, want := result.Spec.Timeouts.ResponseHeader, tc.wantRespHeader; !reflect.DeepEqual(got, want) {
+				t.Errorf("responseHeader timeout: got %v, want %v", got, want)
 			}
 		})
-	})
-})
+	}
+}
+
+func TestTableQueueCounterIntegrationHTTPSO(t *testing.T) {
+	httpso := &httpv1alpha1.HTTPScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-httpso",
+			Namespace: "default",
+		},
+		Spec: httpv1alpha1.HTTPScaledObjectSpec{
+			Hosts: []string{"example.com"},
+			ScalingMetric: &httpv1alpha1.ScalingMetricSpec{
+				Rate: &httpv1alpha1.RateMetricSpec{
+					Window:      metav1.Duration{Duration: 2 * time.Minute},
+					Granularity: metav1.Duration{Duration: 2 * time.Second},
+				},
+			},
+		},
+	}
+
+	cl := newTestClient(httpso)
+	counter := queue.NewMemory()
+	tbl := NewTable(cl, counter)
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Verify the queue counter registered the key
+	key := "default/test-httpso"
+	counts, err := counter.Current()
+	if err != nil {
+		t.Fatalf("failed to get current counts: %v", err)
+	}
+	if _, exists := counts[key]; !exists {
+		t.Errorf("expected queue counter to have key %q", key)
+	}
+}
+
+func TestTableSignalHTTPSO_DeletedObjectBecomesUnroutable(t *testing.T) {
+	httpso := &httpv1alpha1.HTTPScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "to-delete",
+			Namespace: "default",
+		},
+		Spec: httpv1alpha1.HTTPScaledObjectSpec{
+			Hosts: []string{"delete.example.com"},
+		},
+	}
+
+	cl := newTestClient(httpso)
+	counter := queue.NewMemory()
+	tbl := NewTable(cl, counter)
+
+	cancel := startTableAndWaitForSync(t, tbl)
+	defer cancel()
+
+	// Verify initial routing works
+	req, _ := http.NewRequest("GET", "http://delete.example.com/test", nil)
+	result := tbl.Route(req)
+	if result == nil || result.Name != "to-delete" {
+		t.Fatal("expected to route to 'to-delete'")
+	}
+
+	// Verify key exists in counter
+	key := "default/to-delete"
+	counts, err := counter.Current()
+	if err != nil {
+		t.Fatalf("failed to get current counts: %v", err)
+	}
+	if _, exists := counts[key]; !exists {
+		t.Fatalf("expected queue counter to have key %q before deletion", key)
+	}
+
+	// Delete the object
+	if err := cl.Delete(context.Background(), httpso); err != nil {
+		t.Fatalf("failed to delete HTTPScaledObject: %v", err)
+	}
+
+	// Signal to trigger refresh
+	tbl.Signal()
+
+	// Wait for the deletion to be picked up
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if tbl.Route(req) == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify object is no longer routable
+	if tbl.Route(req) != nil {
+		t.Error("expected deleted object to be unroutable")
+	}
+
+	// Verify key was removed from counter
+	counts, err = counter.Current()
+	if err != nil {
+		t.Fatalf("failed to get current counts: %v", err)
+	}
+	if _, exists := counts[key]; exists {
+		t.Errorf("expected queue counter to NOT have key %q after deletion", key)
+	}
+}

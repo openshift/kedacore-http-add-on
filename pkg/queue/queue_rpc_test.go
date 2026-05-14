@@ -17,7 +17,6 @@ func TestQueueSizeHandlerSuccess(t *testing.T) {
 	r := require.New(t)
 	reader := &FakeCountReader{
 		concurrency: 123,
-		rps:         100,
 		err:         nil,
 	}
 
@@ -25,14 +24,13 @@ func TestQueueSizeHandlerSuccess(t *testing.T) {
 	req, rec := pkghttp.NewTestCtx("GET", "/queue")
 	handler.ServeHTTP(rec, req)
 	r.Equal(200, rec.Code, "response code")
-	respMap := map[string]Count{}
+	respMap := Counts{}
 	decodeErr := json.NewDecoder(rec.Body).Decode(&respMap)
 	r.NoError(decodeErr)
-	r.Equalf(1, len(respMap), "response JSON length was not 1")
+	r.Lenf(respMap, 1, "response JSON length was not 1")
 	sizeVal, ok := respMap["sample.com"]
 	r.Truef(ok, "'sample.com' entry not available in return JSON")
 	r.Equalf(reader.concurrency, sizeVal.Concurrency, "returned JSON concurrent size was wrong")
-	r.Equalf(reader.rps, sizeVal.RPS, "returned JSON rps size was wrong")
 
 	reader.err = errors.New("test error")
 	req, rec = pkghttp.NewTestCtx("GET", "/queue")
@@ -45,7 +43,6 @@ func TestQueueSizeHandlerFail(t *testing.T) {
 	r := require.New(t)
 	reader := &FakeCountReader{
 		concurrency: 0,
-		rps:         0,
 		err:         errors.New("test error"),
 	}
 
@@ -60,7 +57,6 @@ func TestQueueSizeHandlerIntegration(t *testing.T) {
 	r := require.New(t)
 	reader := &FakeCountReader{
 		concurrency: 50,
-		rps:         60,
 		err:         nil,
 	}
 
@@ -71,11 +67,10 @@ func TestQueueSizeHandlerIntegration(t *testing.T) {
 	httpCl := srv.Client()
 	counts, err := GetCounts(httpCl, *url)
 	r.NoError(err)
-	r.Equal(1, len(counts.Counts))
-	for _, val := range counts.Counts {
+	r.Len(counts, 1)
+	for _, val := range counts {
 		r.Equal(reader.concurrency, val.Concurrency)
-		r.Equal(reader.rps, val.RPS)
 	}
 	reqs := hdl.IncomingRequests()
-	r.Equal(1, len(reqs))
+	r.Len(reqs, 1)
 }

@@ -1,7 +1,7 @@
 package util
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -9,9 +9,7 @@ import (
 )
 
 var _ = Describe("AtomicValue", func() {
-	var (
-		i int
-	)
+	var i int
 
 	BeforeEach(func() {
 		i = rand.Int()
@@ -19,7 +17,7 @@ var _ = Describe("AtomicValue", func() {
 
 	Context("New", func() {
 		It("returns an AtomicValue with the expected value", func() {
-			v := NewAtomicValue[int](i)
+			v := NewAtomicValue(i)
 
 			out, ok := v.atomicValue.Load().(int)
 			Expect(ok).To(BeTrue())
@@ -54,7 +52,7 @@ var _ = Describe("AtomicValue", func() {
 
 	Context("E2E", func() {
 		It("succeeds", func() {
-			v := NewAtomicValue[int](i)
+			v := NewAtomicValue(i)
 
 			out0 := v.Get()
 			Expect(out0).To(Equal(i))

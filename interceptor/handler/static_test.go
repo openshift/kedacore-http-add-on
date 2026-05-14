@@ -35,14 +35,14 @@ var _ = Describe("ServeHTTP", func() {
 		sh.ServeHTTP(w, r)
 
 		Expect(w.Code).To(Equal(sc))
-		Expect(w.Body.String()).To(Equal(st))
+		Expect(w.Body.String()).To(Equal(st + "\n"))
 	})
 
 	It("logs the failed request", func() {
 		var b bool
 		r = r.WithContext(util.ContextWithLogger(r.Context(), funcr.NewJSON(
 			func(obj string) {
-				var m map[string]interface{}
+				var m map[string]any
 
 				err := json.Unmarshal([]byte(obj), &m)
 				Expect(err).NotTo(HaveOccurred())

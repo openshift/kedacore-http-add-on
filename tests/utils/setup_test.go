@@ -1,5 +1,4 @@
 //go:build e2e
-// +build e2e
 
 package utils
 
@@ -25,8 +24,10 @@ config:
       verbosity: basic
     prometheus:
       endpoint: 0.0.0.0:8889
-    zipkin:
-      endpoint: http://zipkin.zipkin:9411/api/v2/spans
+    otlp/jaeger:
+      endpoint: jaeger.jaeger:4317
+      tls:
+        insecure: true
   receivers:
     jaeger: null
     prometheus: null
@@ -37,7 +38,7 @@ config:
         receivers:
           - otlp
         exporters:
-          - zipkin
+          - otlp/jaeger
       metrics:
         receivers:
           - otlp
@@ -107,57 +108,74 @@ spec:
         namespaces:
           from: All
 `
-	zipkinTemplate = `---
+	jaegerTemplate = `---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  creationTimestamp: null
   labels:
-    app: zipkin
-  name: zipkin
-  namespace: zipkin
+    app: jaeger
+  name: jaeger
+  namespace: jaeger
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: zipkin
-  strategy: {}
+      app: jaeger
   template:
     metadata:
-      creationTimestamp: null
       labels:
-        app: zipkin
+        app: jaeger
     spec:
       containers:
-      - image: openzipkin/zipkin:3
-        name: zipkin
-        env:
-        - name: "JAVA_OPTS"
-          value: "-XX:MaxRAMPercentage=80 -XX:InitialRAMPercentage=80"
-        resources:
-          limits:
-            memory: "256M"
-          requests:
-            memory: "256M"
+      - image: jaegertracing/jaeger:2.15.1
+        name: jaeger
+        ports:
+        - containerPort: 16686
+          name: query
+          protocol: TCP
+        - containerPort: 16685
+          name: grpc-query
+          protocol: TCP
+        - containerPort: 4317
+          name: otlp-grpc
+          protocol: TCP
+        - containerPort: 4318
+          name: otlp-http
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 16686
+          initialDelaySeconds: 5
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  creationTimestamp: null
   labels:
-    app: zipkin
-  name: zipkin
-  namespace: zipkin
+    app: jaeger
+  name: jaeger
+  namespace: jaeger
 spec:
   ports:
-  - port: 9411
+  - name: grpc-query
+    port: 16685
+    targetPort: 16685
     protocol: TCP
-    targetPort: 9411
+  - name: query
+    port: 16686
+    targetPort: 16686
+    protocol: TCP
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+    protocol: TCP
+  - name: otlp-http
+    port: 4318
+    targetPort: 4318
+    protocol: TCP
   selector:
-    app: zipkin
+    app: jaeger
   type: ClusterIP
-status:
-  loadBalancer: {}
 `
 )
 
@@ -282,11 +300,11 @@ func TestSetupOpentelemetryComponents(t *testing.T) {
 	otlpServiceTempFileName := "otlpServicePatch.yml"
 	defer os.Remove(otlpTempFileName)
 	defer os.Remove(otlpServiceTempFileName)
-	err := os.WriteFile(otlpTempFileName, []byte(OtlpConfig), 0755)
-	assert.NoErrorf(t, err, "cannot create otlp config file - %s", err)
+	err := os.WriteFile(otlpTempFileName, []byte(OtlpConfig), 0o600)
+	require.NoErrorf(t, err, "cannot create otlp config file - %s", err)
 
-	err = os.WriteFile(otlpServiceTempFileName, []byte(OtlpServicePatch), 0755)
-	assert.NoErrorf(t, err, "cannot create otlp service patch file - %s", err)
+	err = os.WriteFile(otlpServiceTempFileName, []byte(OtlpServicePatch), 0o600)
+	require.NoErrorf(t, err, "cannot create otlp service patch file - %s", err)
 
 	_, err = ExecuteCommand("helm version")
 	require.NoErrorf(t, err, "helm is not installed - %s", err)
@@ -307,19 +325,19 @@ func TestSetupOpentelemetryComponents(t *testing.T) {
 	require.NoErrorf(t, err, "cannot update opentelemetry ports - %s", err)
 }
 
-func TestDeployZipkin(t *testing.T) {
+func TestDeployJaeger(t *testing.T) {
 	KubeClient = GetKubernetesClient(t)
-	CreateNamespace(t, KubeClient, "zipkin")
+	CreateNamespace(t, KubeClient, "jaeger")
 
-	zipkinTemplateFileName := "otlpServicePatch.yml"
-	defer os.Remove(zipkinTemplateFileName)
-	err := os.WriteFile(zipkinTemplateFileName, []byte(zipkinTemplate), 0755)
-	assert.NoErrorf(t, err, "cannot create otlp config file - %s", err)
+	jaegerTemplateFileName := "jaeger.yml"
+	defer os.Remove(jaegerTemplateFileName)
+	err := os.WriteFile(jaegerTemplateFileName, []byte(jaegerTemplate), 0o600)
+	require.NoErrorf(t, err, "cannot create jaeger config file - %s", err)
 
-	_, err = ExecuteCommand(fmt.Sprintf("kubectl apply -f  %s -n %s", zipkinTemplateFileName, "zipkin"))
-	require.NoErrorf(t, err, "cannot deploy zipkin - %s", err)
+	_, err = ExecuteCommand(fmt.Sprintf("kubectl apply -f %s -n %s", jaegerTemplateFileName, "jaeger"))
+	require.NoErrorf(t, err, "cannot deploy jaeger - %s", err)
 
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, KubeClient, "zipkin", "zipkin", 1, 6, 10),
+	assert.True(t, WaitForDeploymentReplicaReadyCount(t, KubeClient, "jaeger", "jaeger", 1, 30, 6),
 		"replica count should be 1 after 3 minutes")
 }
 
@@ -337,7 +355,7 @@ func TestSetupTLSConfiguration(t *testing.T) {
 }
 
 func TestDeployKEDAHttpAddOn(t *testing.T) {
-	out, err := ExecuteCommandWithDir("make deploy", "../..")
+	out, err := ExecuteCommandWithDir("make deploy-e2e", "../..")
 	require.NoErrorf(t, err, "error deploying KEDA Http Add-on - %s", err)
 
 	t.Log(string(out))

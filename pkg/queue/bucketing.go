@@ -55,6 +55,12 @@ func NewRequestsBuckets(window, granularity time.Duration) *RequestsBuckets {
 	}
 }
 
+// Window returns the total time window of this ring buffer.
+func (t *RequestsBuckets) Window() time.Duration { return t.window }
+
+// Granularity returns the per-bucket time granularity.
+func (t *RequestsBuckets) Granularity() time.Duration { return t.granularity }
+
 // IsEmpty returns true if no data has been recorded for the `window` period.
 func (t *RequestsBuckets) IsEmpty(now time.Time) bool {
 	now = now.Truncate(t.granularity)
@@ -70,7 +76,7 @@ func (t *RequestsBuckets) isEmptyLocked(now time.Time) bool {
 
 func roundToNDigits(n int, f float64) float64 {
 	p := math.Pow10(n)
-	return math.Floor(f*p) / p
+	return math.Round(f*p) / p
 }
 
 // WindowAverage returns the average bucket value over the window.

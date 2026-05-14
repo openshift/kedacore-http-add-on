@@ -19,6 +19,9 @@ package http
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"sync"
 	"time"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -47,6 +50,8 @@ type HTTPScaledObjectReconciler struct {
 
 	ExternalScalerConfig config.ExternalScaler
 	BaseConfig           config.Base
+
+	deprecationWarned sync.Map
 }
 
 // +kubebuilder:rbac:groups=http.keda.sh,resources=httpscaledobjects,verbs=get;list;watch;create;update;patch;delete
@@ -82,6 +87,11 @@ func (r *HTTPScaledObjectReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, finalizeScaledObject(ctx, logger, r.Client, httpso)
 	}
 
+	// TODO(v1): remove before v1 release
+	if _, alreadyWarned := r.deprecationWarned.LoadOrStore(req.String(), true); !alreadyWarned {
+		logger.Info("WARNING: HTTPScaledObject is deprecated and will be removed in a future release, migrate to InterceptorRoute + ScaledObject: https://keda.sh/http-add-on/0.14/operations/migrate-httpscaledobject-to-interceptorroute/")
+	}
+
 	// ensure finalizer is set on this resource
 	if err := ensureFinalizer(ctx, logger, r.Client, httpso); err != nil {
 		return ctrl.Result{}, err
@@ -89,7 +99,7 @@ func (r *HTTPScaledObjectReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// update status
 	httpso.Status.TargetWorkload = fmt.Sprintf("%s/%s/%s", httpso.Spec.ScaleTargetRef.APIVersion, httpso.Spec.ScaleTargetRef.Kind, httpso.Spec.ScaleTargetRef.Name)
-	httpso.Status.TargetService = fmt.Sprintf("%s:%d", httpso.Spec.ScaleTargetRef.Service, httpso.Spec.ScaleTargetRef.Port)
+	httpso.Status.TargetService = net.JoinHostPort(httpso.Spec.ScaleTargetRef.Service, strconv.Itoa(int(httpso.Spec.ScaleTargetRef.Port)))
 
 	// httpso is updated now
 	logger.Info(
@@ -160,6 +170,10 @@ func (r *HTTPScaledObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&httpv1alpha1.HTTPScaledObject{}, builder.WithPredicates(
 			predicate.Or(
+				util.AnnotationKeyChangedPredicate{Keys: []string{
+					OrphanScaledObjectAnnotation,
+					SkipScaledObjectCreationAnnotation,
+				}},
 				predicate.GenerationChangedPredicate{},
 				util.HTTPScaledObjectReadyConditionPredicate{},
 			),

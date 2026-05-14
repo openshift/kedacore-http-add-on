@@ -13,20 +13,35 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	discov1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/kedacore/http-add-on/interceptor/config"
+	"github.com/kedacore/http-add-on/interceptor/metrics"
 	"github.com/kedacore/http-add-on/interceptor/tracing"
-	httpv1alpha1 "github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
+	httpv1beta1 "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
+	kedacache "github.com/kedacore/http-add-on/pkg/cache"
+	kedahttp "github.com/kedacore/http-add-on/pkg/http"
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	"github.com/kedacore/http-add-on/pkg/queue"
 	routingtest "github.com/kedacore/http-add-on/pkg/routing/test"
 )
 
 const (
-	testHost      = "test.example.com"
-	testHTTPSOKey = "test-namespace/test-httpso"
+	testHost       = "test.example.com"
+	testIRKey      = "test-namespace/test-httpso"
+	testServiceKey = "test-namespace/test-service"
 )
+
+var testEndpointSlice = &discov1.EndpointSlice{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "test-service-slice",
+		Namespace: "test-namespace",
+		Labels:    map[string]string{discov1.LabelServiceName: "test-service"},
+	},
+	Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+}
 
 func TestProxyHandler_SuccessfulRequest(t *testing.T) {
 	h := newProxyTestHarness(t, harnessConfig{})
@@ -68,8 +83,8 @@ func TestProxyHandler_ColdStartHeader(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 			}
-			if got := resp.Header.Get("X-KEDA-HTTP-Cold-Start"); got != tt.wantHeader {
-				t.Errorf("X-KEDA-HTTP-Cold-Start = %q, want %q", got, tt.wantHeader)
+			if got := resp.Header.Get(kedahttp.HeaderColdStart); got != tt.wantHeader {
+				t.Errorf("cold-start header = %q, want %q", got, tt.wantHeader)
 			}
 		})
 	}
@@ -108,11 +123,6 @@ func TestProxyHandler_Tracing(t *testing.T) {
 			hasTraceparent := receivedTraceparent != ""
 			if hasTraceparent != tt.tracingEnabled {
 				t.Errorf("backend received Traceparent = %v, want %v", hasTraceparent, tt.tracingEnabled)
-			}
-
-			hasResponseTraceparent := resp.Header.Get("Traceparent") != ""
-			if hasResponseTraceparent != tt.tracingEnabled {
-				t.Errorf("response has Traceparent = %v, want %v", hasResponseTraceparent, tt.tracingEnabled)
 			}
 		})
 	}
@@ -192,14 +202,14 @@ func TestProxyHandler_QueueCounting(t *testing.T) {
 	go func() {
 		defer close(done)
 		resp := h.doRequest(t, http.MethodGet, "/", testHost)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 
 	// Wait for queue increment (blocking send from Increase)
 	select {
 	case event := <-h.Queue.ResizedCh:
-		if event.Host != testHTTPSOKey {
-			t.Errorf("expected host %s, got %s", testHTTPSOKey, event.Host)
+		if event.Host != testIRKey {
+			t.Errorf("expected host %s, got %s", testIRKey, event.Host)
 		}
 		if event.Count != 1 {
 			t.Errorf("expected +1, got %d", event.Count)
@@ -208,8 +218,8 @@ func TestProxyHandler_QueueCounting(t *testing.T) {
 		t.Fatal("timeout waiting for queue increment")
 	}
 
-	// Now unblock the waitFunc
-	close(h.WaitCh)
+	// Unblock the readiness middleware by adding endpoints to the cache
+	h.ReadyCache.Update(testServiceKey, []*discov1.EndpointSlice{testEndpointSlice})
 
 	// Wait for queue decrement
 	select {
@@ -233,7 +243,7 @@ func TestProxyHandler_QueueCounting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get queue counts: %v", err)
 	}
-	concurrency := counts.Counts[testHTTPSOKey].Concurrency
+	concurrency := counts[testIRKey].Concurrency
 	if concurrency != 0 {
 		t.Errorf("expected final concurrency to be 0, got %d", concurrency)
 	}
@@ -262,10 +272,10 @@ func TestProxyHandler_TLSBackend(t *testing.T) {
 
 // proxyTestHarness provides a configured proxy handler for testing.
 type proxyTestHarness struct {
-	Handler http.Handler
-	Backend *httptest.Server
-	Queue   *queue.FakeCounter
-	WaitCh  chan struct{}
+	Handler    http.Handler
+	Backend    *httptest.Server
+	Queue      *queue.FakeCounter
+	ReadyCache *k8s.ReadyEndpointsCache
 }
 
 type harnessConfig struct {
@@ -306,49 +316,47 @@ func newProxyTestHarness(t *testing.T, cfg harnessConfig) *proxyTestHarness {
 	}
 	t.Cleanup(backend.Close)
 
-	// Create queue and wait function
-	var queueCounter queue.Counter
+	// Create queue
 	var fakeQueue *queue.FakeCounter
-	var waitCh chan struct{}
-	var waitFunc func(context.Context, string, string) (bool, error)
-
 	if cfg.useBlockingQueue {
-		// Blocking mode: for testing queue counting behavior
 		fakeQueue = queue.NewFakeCounter()
-		queueCounter = fakeQueue
-		waitCh = make(chan struct{})
-		waitFunc = func(ctx context.Context, _, _ string) (bool, error) {
-			select {
-			case <-waitCh:
-				return cfg.simulateColdStart, nil
-			case <-ctx.Done():
-				return false, ctx.Err()
-			}
-		}
 	} else {
-		// Non-blocking mode: requests flow through immediately
-		queueCounter = queue.NewFakeCounterBuffered()
-		waitFunc = func(ctx context.Context, _, _ string) (bool, error) {
-			return cfg.simulateColdStart, nil
+		fakeQueue = queue.NewFakeCounterBuffered()
+	}
+
+	// Create ready cache
+	readyCache := k8s.NewReadyEndpointsCache(logr.Discard())
+
+	// For non-blocking mode, pre-populate the cache so requests flow through immediately.
+	// For cold start simulation, populate asynchronously so WaitForReady returns isColdStart=true.
+	if !cfg.useBlockingQueue {
+		if cfg.simulateColdStart {
+			// Populate asynchronously: WaitForReady will block briefly, then return isColdStart=true
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				readyCache.Update(testServiceKey, []*discov1.EndpointSlice{testEndpointSlice})
+			}()
+		} else {
+			// Pre-populate: WaitForReady returns immediately with isColdStart=false
+			readyCache.Update(testServiceKey, []*discov1.EndpointSlice{testEndpointSlice})
 		}
 	}
 
 	// Create routing table
 	routingTable := routingtest.NewTable()
-	httpso := &httpv1alpha1.HTTPScaledObject{
+	ir := &httpv1beta1.InterceptorRoute{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-httpso",
 			Namespace: "test-namespace",
 		},
-		Spec: httpv1alpha1.HTTPScaledObjectSpec{
-			ScaleTargetRef: httpv1alpha1.ScaleTargetRef{
-				Name:    "test-deployment",
+		Spec: httpv1beta1.InterceptorRouteSpec{
+			Target: httpv1beta1.TargetRef{
 				Service: "test-service",
 				Port:    80,
 			},
 		},
 	}
-	routingTable.Memory[testHost] = httpso
+	routingTable.Memory[testHost] = ir
 
 	// Build handler using production function
 	var tlsCfg *tls.Config
@@ -357,26 +365,28 @@ func newProxyTestHarness(t *testing.T, cfg harnessConfig) *proxyTestHarness {
 	}
 	handler := BuildProxyHandler(&ProxyHandlerConfig{
 		Logger:       logr.Discard(),
-		Queue:        queueCounter,
-		WaitFunc:     waitFunc,
+		Queue:        fakeQueue,
+		ReadyCache:   readyCache,
 		RoutingTable: routingTable,
-		ProbeHandler: nil,
-		ServiceCache: k8s.NewFakeServiceCache(),
+		Reader:       fake.NewClientBuilder().WithScheme(kedacache.NewScheme()).Build(),
 		Timeouts: config.Timeouts{
-			WorkloadReplicas: 5 * time.Second,
-			ResponseHeader:   5 * time.Second,
+			Connect:        500 * time.Millisecond,
+			Readiness:      5 * time.Second,
+			Request:        60 * time.Second,
+			ResponseHeader: 5 * time.Second,
 		},
 		Serving:             config.Serving{EnableColdStartHeader: cfg.enableColdStartHeader},
 		TLSConfig:           tlsCfg,
 		Tracing:             config.Tracing{Enabled: cfg.tracingEnabled},
+		Instruments:         metrics.NewNoopInstruments(),
 		dialAddressOverride: backend.Listener.Addr().String(),
 	})
 
 	return &proxyTestHarness{
-		Handler: handler,
-		Backend: backend,
-		Queue:   fakeQueue, // nil if not using blocking queue
-		WaitCh:  waitCh,
+		Handler:    handler,
+		Backend:    backend,
+		Queue:      fakeQueue,
+		ReadyCache: readyCache,
 	}
 }
 

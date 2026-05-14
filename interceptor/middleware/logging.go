@@ -3,6 +3,7 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-logr/logr"
 
@@ -10,20 +11,19 @@ import (
 )
 
 const (
-	CombinedLogFormat     = `%s %s %s [%s] "%s %s %s" %d %d "%s" "%s"`
-	CombinedLogTimeFormat = "02/Jan/2006:15:04:05 -0700"
-	CombinedLogBlankValue = "-"
+	combinedLogFormat     = `%s - - [%s] "%s %s %s" %d %d "%s" "%s"`
+	combinedLogTimeFormat = "02/Jan/2006:15:04:05 -0700"
 )
 
 type Logging struct {
-	logger          logr.Logger
-	upstreamHandler http.Handler
+	logger logr.Logger
+	next   http.Handler
 }
 
-func NewLogging(logger logr.Logger, upstreamHandler http.Handler) *Logging {
+func NewLogging(next http.Handler, logger logr.Logger) *Logging {
 	return &Logging{
-		logger:          logger,
-		upstreamHandler: upstreamHandler,
+		logger: logger,
+		next:   next,
 	}
 }
 
@@ -31,42 +31,32 @@ var _ http.Handler = (*Logging)(nil)
 
 func (lm *Logging) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = util.RequestWithLogger(r, lm.logger.WithName("LoggingMiddleware"))
-	w = newResponseWriter(w)
+	rw := newInstrumentedResponseWriter(w)
 
-	var sw util.Stopwatch
-	defer lm.logAsync(w, r, &sw)
+	startTime := time.Now()
+	defer lm.logAsync(rw, r, startTime)
 
-	sw.Start()
-	defer sw.Stop()
-
-	lm.upstreamHandler.ServeHTTP(w, r)
+	lm.next.ServeHTTP(rw, r)
 }
 
-func (lm *Logging) logAsync(w http.ResponseWriter, r *http.Request, sw *util.Stopwatch) {
-	go lm.log(w, r, sw)
+func (lm *Logging) logAsync(rw *instrumentedResponseWriter, r *http.Request, startTime time.Time) {
+	go lm.log(rw, r, startTime)
 }
 
-func (lm *Logging) log(w http.ResponseWriter, r *http.Request, sw *util.Stopwatch) {
+func (lm *Logging) log(rw *instrumentedResponseWriter, r *http.Request, startTime time.Time) {
 	ctx := r.Context()
 	logger := util.LoggerFromContext(ctx)
 
-	lrw := w.(*responseWriter)
-	if lrw == nil {
-		lrw = newResponseWriter(w)
-	}
-
-	timestamp := sw.StartTime().Format(CombinedLogTimeFormat)
+	timestamp := startTime.Format(combinedLogTimeFormat)
 	log := fmt.Sprintf(
-		CombinedLogFormat,
+		combinedLogFormat,
 		r.RemoteAddr,
-		CombinedLogBlankValue,
-		CombinedLogBlankValue,
 		timestamp,
 		r.Method,
 		r.URL.Path,
 		r.Proto,
-		lrw.StatusCode(),
-		lrw.BytesWritten(),
+		rw.statusCode,
+		rw.bytesWritten,
 		r.Referer(),
 		r.UserAgent(),
 	)

@@ -1,5 +1,4 @@
 //go:build e2e
-// +build e2e
 
 package utils
 
@@ -39,6 +38,10 @@ func TestRemoveArgoRollouts(t *testing.T) {
 
 func TestRemoveKEDANamespace(t *testing.T) {
 	DeleteNamespace(t, KEDANamespace)
+}
+
+func TestRemoveJaeger(t *testing.T) {
+	DeleteNamespace(t, "jaeger")
 }
 
 func TestRemoveOpentelemetryComponents(t *testing.T) {

@@ -1,37 +1,41 @@
 package middleware
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	httpv1alpha1 "github.com/kedacore/http-add-on/operator/apis/http/v1alpha1"
-	"github.com/kedacore/http-add-on/pkg/k8s"
+	httpv1beta1 "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
+	"github.com/kedacore/http-add-on/pkg/cache"
 	routingtest "github.com/kedacore/http-add-on/pkg/routing/test"
 )
+
+const requestTimeout = 60 * time.Second
 
 var _ = Describe("RoutingMiddleware", func() {
 	Context("New", func() {
 		It("returns new object with expected fields", func() {
 			var (
 				routingTable    = routingtest.NewTable()
-				probeHandler    = http.NewServeMux()
 				upstreamHandler = http.NewServeMux()
 			)
 			emptyHandler := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-			probeHandler.Handle("/probe", emptyHandler)
 			upstreamHandler.Handle("/upstream", emptyHandler)
-			svcCache := k8s.NewFakeServiceCache()
+			fakeClient := fake.NewClientBuilder().WithScheme(cache.NewScheme()).Build()
 
-			rm := NewRouting(routingTable, probeHandler, upstreamHandler, svcCache, false)
+			rm := NewRouting(upstreamHandler, routingTable, fakeClient, false, requestTimeout)
 			Expect(rm).NotTo(BeNil())
 			Expect(rm.routingTable).To(Equal(routingTable))
-			Expect(rm.probeHandler).To(Equal(probeHandler))
-			Expect(rm.upstreamHandler).To(Equal(upstreamHandler))
+			Expect(rm.next).To(Equal(upstreamHandler))
 		})
 	})
 
@@ -43,34 +47,27 @@ var _ = Describe("RoutingMiddleware", func() {
 
 		var (
 			upstreamHandler   *http.ServeMux
-			probeHandler      *http.ServeMux
-			svcCache          *k8s.FakeServiceCache
+			client            client.Reader
 			routingTable      *routingtest.Table
 			routingMiddleware *Routing
 			w                 *httptest.ResponseRecorder
 			r                 *http.Request
 
-			httpso = httpv1alpha1.HTTPScaledObject{
-				Spec: httpv1alpha1.HTTPScaledObjectSpec{
-					Hosts: []string{
-						host,
-					},
-					ScaleTargetRef: httpv1alpha1.ScaleTargetRef{
+			ir = httpv1beta1.InterceptorRoute{
+				Spec: httpv1beta1.InterceptorRouteSpec{
+					Target: httpv1beta1.TargetRef{
 						Port: 80,
 					},
 				},
 			}
 
-			httpsoWithPortName = httpv1alpha1.HTTPScaledObject{
+			irWithPortName = httpv1beta1.InterceptorRoute{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "keda",
 					Namespace: "default",
 				},
-				Spec: httpv1alpha1.HTTPScaledObjectSpec{
-					Hosts: []string{
-						"keda2.sh",
-					},
-					ScaleTargetRef: httpv1alpha1.ScaleTargetRef{
+				Spec: httpv1beta1.InterceptorRouteSpec{
+					Target: httpv1beta1.TargetRef{
 						Service:  "keda-svc",
 						PortName: "http",
 					},
@@ -94,10 +91,9 @@ var _ = Describe("RoutingMiddleware", func() {
 
 		BeforeEach(func() {
 			upstreamHandler = http.NewServeMux()
-			probeHandler = http.NewServeMux()
 			routingTable = routingtest.NewTable()
-			svcCache = k8s.NewFakeServiceCache()
-			routingMiddleware = NewRouting(routingTable, probeHandler, upstreamHandler, svcCache, false)
+			client = fake.NewClientBuilder().WithScheme(cache.NewScheme()).Build()
+			routingMiddleware = NewRouting(upstreamHandler, routingTable, client, false, requestTimeout)
 
 			w = httptest.NewRecorder()
 
@@ -122,16 +118,10 @@ var _ = Describe("RoutingMiddleware", func() {
 					uh = true
 				}))
 
-				var ph bool
-				probeHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					ph = true
-				}))
-
-				routingTable.Memory[host] = &httpso
+				routingTable.Memory[host] = &ir
 
 				routingMiddleware.ServeHTTP(w, r)
 				Expect(uh).To(BeTrue())
-				Expect(ph).To(BeFalse())
 				Expect(w.Code).To(Equal(sc))
 				Expect(w.Body.String()).To(Equal(st))
 			})
@@ -139,7 +129,9 @@ var _ = Describe("RoutingMiddleware", func() {
 
 		When("route is found with portName", func() {
 			It("routes to the upstream handler", func() {
-				svcCache.Add(*svc)
+				clientWithSvc := fake.NewClientBuilder().WithScheme(cache.NewScheme()).WithObjects(svc).Build()
+				routingMiddleware = NewRouting(upstreamHandler, routingTable, clientWithSvc, false, requestTimeout)
+
 				var (
 					sc = http.StatusTeapot
 					st = http.StatusText(sc)
@@ -155,17 +147,11 @@ var _ = Describe("RoutingMiddleware", func() {
 					uh = true
 				}))
 
-				var ph bool
-				probeHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					ph = true
-				}))
-
-				routingTable.Memory["keda2.sh"] = &httpsoWithPortName
+				routingTable.Memory["keda2.sh"] = &irWithPortName
 
 				r.Host = "keda2.sh"
 				routingMiddleware.ServeHTTP(w, r)
 				Expect(uh).To(BeTrue())
-				Expect(ph).To(BeFalse())
 				Expect(w.Code).To(Equal(sc))
 				Expect(w.Body.String()).To(Equal(st))
 			})
@@ -188,59 +174,99 @@ var _ = Describe("RoutingMiddleware", func() {
 					uh = true
 				}))
 
-				var ph bool
-				probeHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					ph = true
-				}))
-
-				routingTable.Memory["keda2.sh"] = &httpsoWithPortName
+				routingTable.Memory["keda2.sh"] = &irWithPortName
 
 				r.Host = "keda2.sh"
 				routingMiddleware.ServeHTTP(w, r)
 				Expect(uh).To(BeFalse())
-				Expect(ph).To(BeFalse())
 				Expect(w.Code).To(Equal(http.StatusInternalServerError))
-				Expect(w.Body.String()).To(Equal("Internal Server Error"))
+				Expect(w.Body.String()).To(Equal("Internal Server Error\n"))
+			})
+		})
+
+		When("route is found with timeouts", func() {
+			It("sets a context deadline from global timeout", func() {
+				var hasDeadline bool
+				upstreamHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, hasDeadline = r.Context().Deadline()
+					w.WriteHeader(http.StatusOK)
+				}))
+
+				routingTable.Memory[host] = &ir
+				routingMiddleware.ServeHTTP(w, r)
+				Expect(hasDeadline).To(BeTrue())
+			})
+
+			It("uses per-route request timeout override instead of global", func() {
+				perRouteTimeout := 5 * time.Second
+				irWithTimeout := httpv1beta1.InterceptorRoute{
+					Spec: httpv1beta1.InterceptorRouteSpec{
+						Target: httpv1beta1.TargetRef{Port: 80},
+						Timeouts: httpv1beta1.InterceptorRouteTimeouts{
+							Request: &metav1.Duration{Duration: perRouteTimeout},
+						},
+					},
+				}
+
+				var capturedDeadline time.Time
+				upstreamHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					capturedDeadline, _ = r.Context().Deadline()
+					w.WriteHeader(http.StatusOK)
+				}))
+
+				routingTable.Memory[host] = &irWithTimeout
+				before := time.Now()
+				routingMiddleware.ServeHTTP(w, r)
+
+				deadline := capturedDeadline.Sub(before)
+				tolerance := 500 * time.Millisecond
+				Expect(deadline).To(
+					BeNumerically("~", perRouteTimeout, tolerance),
+					fmt.Sprintf("deadline %v should be close to per-route timeout %v (±%v), not the global timeout %v", deadline, perRouteTimeout, tolerance, requestTimeout),
+				)
+			})
+		})
+
+		When("route is found with zero request timeout", func() {
+			It("does not set a context deadline", func() {
+				noTimeoutMiddleware := NewRouting(upstreamHandler, routingTable, client, false, 0)
+
+				var hasDeadline bool
+				upstreamHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, hasDeadline = r.Context().Deadline()
+					w.WriteHeader(http.StatusOK)
+				}))
+
+				routingTable.Memory[host] = &ir
+				noTimeoutMiddleware.ServeHTTP(w, r)
+				Expect(hasDeadline).To(BeFalse())
+			})
+		})
+
+		When("per-route request timeout is explicitly zero with non-zero global", func() {
+			It("disables the context deadline", func() {
+				irWithZeroTimeout := httpv1beta1.InterceptorRoute{
+					Spec: httpv1beta1.InterceptorRouteSpec{
+						Target: httpv1beta1.TargetRef{Port: 80},
+						Timeouts: httpv1beta1.InterceptorRouteTimeouts{
+							Request: &metav1.Duration{Duration: 0},
+						},
+					},
+				}
+
+				var hasDeadline bool
+				upstreamHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, hasDeadline = r.Context().Deadline()
+					w.WriteHeader(http.StatusOK)
+				}))
+
+				routingTable.Memory[host] = &irWithZeroTimeout
+				routingMiddleware.ServeHTTP(w, r)
+				Expect(hasDeadline).To(BeFalse())
 			})
 		})
 
 		When("route is not found", func() {
-			It("routes to the probe handler", func() {
-				const (
-					uaKey = "User-Agent"
-					uaVal = "kube-probe/0"
-				)
-
-				var (
-					sc = http.StatusTeapot
-					st = http.StatusText(sc)
-				)
-
-				var uh bool
-				upstreamHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					uh = true
-				}))
-
-				var ph bool
-				probeHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					w.WriteHeader(http.StatusTeapot)
-
-					_, err := w.Write([]byte(st))
-					Expect(err).NotTo(HaveOccurred())
-
-					ph = true
-				}))
-
-				r.Header.Set(uaKey, uaVal)
-
-				routingMiddleware.ServeHTTP(w, r)
-
-				Expect(uh).To(BeFalse())
-				Expect(ph).To(BeTrue())
-				Expect(w.Code).To(Equal(sc))
-				Expect(w.Body.String()).To(Equal(st))
-			})
-
 			It("serves 404", func() {
 				var (
 					sc = http.StatusNotFound
@@ -252,80 +278,81 @@ var _ = Describe("RoutingMiddleware", func() {
 					uh = true
 				}))
 
-				var ph bool
-				probeHandler.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					ph = true
-				}))
-
 				routingMiddleware.ServeHTTP(w, r)
 
 				Expect(uh).To(BeFalse())
-				Expect(ph).To(BeFalse())
 				Expect(w.Code).To(Equal(sc))
-				Expect(w.Body.String()).To(Equal(st))
+				Expect(w.Body.String()).To(Equal(st + "\n"))
 			})
 		})
 	})
-
-	Context("isKubeProbe", func() {
-		const (
-			uaKey = "User-Agent"
-		)
-
-		var (
-			r *http.Request
-		)
-
-		BeforeEach(func() {
-			r = httptest.NewRequest(http.MethodGet, "/", nil)
-		})
-
-		It("returns true if the request is from kube-probe", func() {
-			const (
-				uaVal = "Go-http-client/1.1 kube-probe/1.27.1 (linux/amd64) kubernetes/4c94112"
-			)
-
-			r.Header.Set(uaKey, uaVal)
-
-			var rm Routing
-			b := rm.isProbe(r)
-			Expect(b).To(BeTrue())
-		})
-
-		It("returns true if the request is from GoogleHC", func() {
-			const (
-				uaVal = "Go-http-client/1.1 GoogleHC/1.0 (linux/amd64) kubernetes/4c94112"
-			)
-
-			r.Header.Set(uaKey, uaVal)
-
-			var rm Routing
-			b := rm.isProbe(r)
-			Expect(b).To(BeTrue())
-		})
-
-		It("returns true if the request is from AWS ELB", func() {
-			const (
-				uaVal = "Go-http-client/1.1 ELB-HealthChecker/2.0 (linux/amd64) kubernetes/4c94112"
-			)
-
-			r.Header.Set(uaKey, uaVal)
-
-			var rm Routing
-			b := rm.isProbe(r)
-			Expect(b).To(BeTrue())
-		})
-
-		It("returns false if the request is not from kube-probe or GoogleHC or ELB-HealthChecker", func() {
-			const (
-				uaVal = "Go-http-client/1.1 kubectl/v1.27.1 (linux/amd64) kubernetes/4c94112"
-			)
-
-			r.Header.Set(uaKey, uaVal)
-
-			var rm Routing
-			b := rm.isProbe(r)
-			Expect(b).To(BeFalse())
-		})
-	})
 })
+
+func TestRouting_PopulatesRouteInfo(t *testing.T) {
+	tests := map[string]struct {
+		ir            *httpv1beta1.InterceptorRoute
+		wantName      string
+		wantNamespace string
+		wantStatus    int
+	}{
+		"matched route sets name and namespace": {
+			ir: &httpv1beta1.InterceptorRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-route",
+					Namespace: "my-ns",
+				},
+				Spec: httpv1beta1.InterceptorRouteSpec{
+					Target: httpv1beta1.TargetRef{
+						Service: "test-svc",
+						Port:    8080,
+					},
+				},
+			},
+			wantName:      "my-route",
+			wantNamespace: "my-ns",
+			wantStatus:    http.StatusOK,
+		},
+		"unmatched route leaves route info empty": {
+			ir:            nil,
+			wantName:      "",
+			wantNamespace: "",
+			wantStatus:    http.StatusNotFound,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			table := routingtest.NewTable()
+			fakeClient := fake.NewClientBuilder().WithScheme(cache.NewScheme()).Build()
+
+			inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+
+			host := "test.example.com"
+			if tc.ir != nil {
+				table.Memory[host] = tc.ir
+			}
+
+			middleware := NewRouting(inner, table, fakeClient, false, 0)
+
+			info := &routeInfo{}
+			req := httptest.NewRequest("GET", "/path", nil)
+			req.Host = host
+			req = req.WithContext(contextWithRouteInfo(req.Context(), info))
+
+			rec := httptest.NewRecorder()
+			middleware.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status: got %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if info.Name != tc.wantName {
+				t.Fatalf("routeInfo.Name: got %q, want %q", info.Name, tc.wantName)
+			}
+			if info.Namespace != tc.wantNamespace {
+				t.Fatalf("routeInfo.Namespace: got %q, want %q", info.Namespace, tc.wantNamespace)
+			}
+		})
+	}
+}

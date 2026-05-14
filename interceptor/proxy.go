@@ -8,8 +8,11 @@ import (
 
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kedacore/http-add-on/interceptor/config"
+	"github.com/kedacore/http-add-on/interceptor/handler"
+	"github.com/kedacore/http-add-on/interceptor/metrics"
 	"github.com/kedacore/http-add-on/interceptor/middleware"
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	kedanet "github.com/kedacore/http-add-on/pkg/net"
@@ -21,14 +24,14 @@ import (
 type ProxyHandlerConfig struct {
 	Logger       logr.Logger
 	Queue        queue.Counter
-	WaitFunc     forwardWaitFunc
+	ReadyCache   *k8s.ReadyEndpointsCache
 	RoutingTable routing.Table
-	ProbeHandler http.Handler
-	ServiceCache k8s.ServiceCache
+	Reader       client.Reader
 	Timeouts     config.Timeouts
 	Serving      config.Serving
 	TLSConfig    *tls.Config
 	Tracing      config.Tracing
+	Instruments  *metrics.Instruments
 
 	// dialAddressOverride redirects all dial attempts to this address (for testing).
 	// If empty, dials to the original target address.
@@ -37,8 +40,7 @@ type ProxyHandlerConfig struct {
 
 // BuildProxyHandler constructs the proxy handler chain.
 func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
-	dialer := kedanet.NewNetDialer(cfg.Timeouts.Connect, cfg.Timeouts.KeepAlive)
-	dialFunc := kedanet.DialContextWithRetry(dialer, cfg.Timeouts.DefaultBackoff())
+	dialFunc := kedanet.DialContextWithRetry(cfg.Timeouts.Connect)
 
 	// Wrap dialer to redirect if override is set (for testing)
 	if cfg.dialAddressOverride != "" {
@@ -53,51 +55,51 @@ func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
 		forwardingTLSCfg = &tls.Config{
 			RootCAs:            cfg.TLSConfig.RootCAs,
 			Certificates:       cfg.TLSConfig.Certificates,
-			InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify,
+			InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify, //nolint:gosec // G402: user-configurable
+			MinVersion:         cfg.TLSConfig.MinVersion,
+			MaxVersion:         cfg.TLSConfig.MaxVersion,
+			CipherSuites:       cfg.TLSConfig.CipherSuites,
+			CurvePreferences:   cfg.TLSConfig.CurvePreferences,
 		}
 	}
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialFunc,
-		ForceAttemptHTTP2:     cfg.Timeouts.ForceHTTP2,
-		MaxIdleConns:          cfg.Timeouts.MaxIdleConns,
-		MaxIdleConnsPerHost:   cfg.Timeouts.MaxIdleConnsPerHost,
-		IdleConnTimeout:       cfg.Timeouts.IdleConnTimeout,
-		TLSHandshakeTimeout:   cfg.Timeouts.TLSHandshakeTimeout,
-		ExpectContinueTimeout: cfg.Timeouts.ExpectContinueTimeout,
-		TLSClientConfig:       forwardingTLSCfg,
-	}
+
+	// Clone DefaultTransport to inherit Go's defaults for IdleConnTimeout, ...
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = dialFunc
+	transport.ForceAttemptHTTP2 = cfg.Timeouts.ForceHTTP2
+	transport.MaxIdleConns = cfg.Timeouts.MaxIdleConns
+	transport.MaxIdleConnsPerHost = cfg.Timeouts.MaxIdleConnsPerHost
+	transport.TLSClientConfig = forwardingTLSCfg
 
 	// Build handler chain (innermost to outermost)
-	var handler http.Handler
+	var h http.Handler
 
-	handler = newForwardingHandler(
-		cfg.Logger,
-		transport,
-		cfg.WaitFunc,
-		newForwardingConfigFromTimeouts(cfg.Timeouts, cfg.Serving),
-		cfg.Tracing,
-	)
+	h = handler.NewUpstream(transport, cfg.Tracing, cfg.Timeouts.ResponseHeader)
 
-	handler = middleware.NewCountingMiddleware(cfg.Queue, handler)
+	h = middleware.NewEndpointResolver(h, cfg.ReadyCache, middleware.EndpointResolverConfig{
+		ReadinessTimeout:      cfg.Timeouts.Readiness,
+		EnableColdStartHeader: cfg.Serving.EnableColdStartHeader,
+	})
 
-	handler = middleware.NewRouting(
+	h = middleware.NewCounting(h, cfg.Queue, cfg.Instruments)
+
+	h = middleware.NewRouting(
+		h,
 		cfg.RoutingTable,
-		cfg.ProbeHandler,
-		handler,
-		cfg.ServiceCache,
+		cfg.Reader,
 		cfg.TLSConfig != nil,
+		cfg.Timeouts.Request,
 	)
 
-	if cfg.Tracing.Enabled {
-		handler = otelhttp.NewHandler(handler, "keda-http-interceptor")
-	}
+	h = middleware.NewMetrics(h, cfg.Instruments)
 
 	if cfg.Serving.LogRequests {
-		handler = middleware.NewLogging(cfg.Logger, handler)
+		h = middleware.NewLogging(h, cfg.Logger)
 	}
 
-	handler = middleware.NewMetrics(handler)
+	if cfg.Tracing.Enabled {
+		h = otelhttp.NewHandler(h, "keda-http-interceptor")
+	}
 
-	return handler
+	return h
 }
