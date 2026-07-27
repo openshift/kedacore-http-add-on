@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"text/template"
@@ -86,6 +87,24 @@ func ExecuteCommand(cmdWithArgs string) ([]byte, error) {
 		}
 	}
 
+	return out, err
+}
+
+func ExecuteCommandWithRetry(t *testing.T, cmdWithArgs string, retries int, delay time.Duration) ([]byte, error) {
+	t.Helper()
+	var out []byte
+	var err error
+	for i := 1; i <= retries; i++ {
+		out, err = ExecuteCommand(cmdWithArgs)
+		if err == nil {
+			return out, nil
+		}
+		if i == retries {
+			break
+		}
+		t.Logf("WARNING: command failed (attempt %d/%d), retrying in %v...: %v", i, retries, delay, err)
+		time.Sleep(delay)
+	}
 	return out, err
 }
 
@@ -398,8 +417,7 @@ func KubectlDeleteWithTemplate(t *testing.T, data any, templateName, config stri
 
 // Delete templates in reverse order of slice
 func KubectlDeleteMultipleWithTemplate(t *testing.T, data any, templates []Template) {
-	for idx := len(templates) - 1; idx >= 0; idx-- {
-		tmpl := templates[idx]
+	for _, tmpl := range slices.Backward(templates) {
 		KubectlDeleteWithTemplate(t, data, tmpl.Name, tmpl.Config)
 	}
 }

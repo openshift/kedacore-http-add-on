@@ -5,6 +5,7 @@ package helpers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -111,10 +112,9 @@ func WithTLSCert(dnsNames []string) PatchDeploymentOption {
 			return err
 		}
 
-		volName := "tls-certs"
 		dep.Spec.Template.Spec.Volumes = append(dep.Spec.Template.Spec.Volumes,
 			corev1.Volume{
-				Name: volName,
+				Name: tlsCertsVolume,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{SecretName: certName},
 				},
@@ -124,13 +124,41 @@ func WithTLSCert(dnsNames []string) PatchDeploymentOption {
 			dep.Spec.Template.Spec.Containers[i].VolumeMounts = append(
 				dep.Spec.Template.Spec.Containers[i].VolumeMounts,
 				corev1.VolumeMount{
-					Name:      volName,
+					Name:      tlsCertsVolume,
 					MountPath: "/certs",
 				},
 			)
 		}
 		return nil
 	}
+}
+
+// RestartInterceptor triggers a rollout restart of the interceptor deployment
+// and waits for the new generation to become fully ready.
+func (f *Framework) RestartInterceptor() error {
+	f.t.Helper()
+
+	dep := &appsv1.Deployment{}
+	if err := f.client.Resources().Get(f.ctx, interceptorDeployment, AddonNamespace, dep); err != nil {
+		return fmt.Errorf("getting interceptor deployment: %w", err)
+	}
+
+	if dep.Spec.Template.Annotations == nil {
+		dep.Spec.Template.Annotations = make(map[string]string)
+	}
+	dep.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+
+	if err := f.client.Resources().Update(f.ctx, dep); err != nil {
+		return fmt.Errorf("updating interceptor deployment: %w", err)
+	}
+
+	if err := wait.For(
+		conditions.New(f.client.Resources()).ResourceMatch(dep, deploymentRolledOut),
+		wait.WithTimeout(defaultWaitTimeout),
+	); err != nil {
+		return fmt.Errorf("interceptor deployment did not recover: %w", err)
+	}
+	return nil
 }
 
 func deploymentRolledOut(object k8s.Object) bool {
