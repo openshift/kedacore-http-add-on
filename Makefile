@@ -25,16 +25,29 @@ IMAGE_OPERATOR_SHA_TAG     ?= $(IMAGE_OPERATOR):$(GIT_COMMIT_SHORT)
 IMAGE_INTERCEPTOR_SHA_TAG  ?= $(IMAGE_INTERCEPTOR):$(GIT_COMMIT_SHORT)
 IMAGE_SCALER_SHA_TAG       ?= $(IMAGE_SCALER):$(GIT_COMMIT_SHORT)
 
-KO_RELEASE_PLATFORMS ?= linux/amd64,linux/arm64
+KO_RELEASE_PLATFORMS ?= linux/amd64,linux/arm64,linux/s390x
 
 # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
-CERT_MANAGER_VERSION ?= v1.20.1
+CERT_MANAGER_VERSION ?= v1.20.2
 # renovate: datasource=helm depName=jaeger registryUrl=https://jaegertracing.github.io/helm-charts
-JAEGER_VERSION ?= 4.7.0
+JAEGER_VERSION ?= 4.11.0
 # renovate: datasource=helm depName=keda registryUrl=https://kedacore.github.io/charts
-KEDA_VERSION ?= 2.19.0
+KEDA_VERSION ?= 2.20.0
 # renovate: datasource=helm depName=opentelemetry-collector registryUrl=https://open-telemetry.github.io/opentelemetry-helm-charts
-OTEL_COLLECTOR_VERSION ?= 0.150.0
+OTEL_COLLECTOR_VERSION ?= 0.158.1
+
+HELM_RETRIES ?= 3
+HELM_RETRY_DELAY ?= 30
+
+define helm-retry
+	for ((i=1; i<=$(HELM_RETRIES); i++)); do \
+		$(1) && break || { \
+			if [ $$i -eq $(HELM_RETRIES) ]; then echo "ERROR: helm command failed after $(HELM_RETRIES) attempts"; exit 1; fi; \
+			echo "WARNING: helm command failed (attempt $$i/$(HELM_RETRIES)), retrying in $(HELM_RETRY_DELAY)s..."; \
+			sleep $(HELM_RETRY_DELAY); \
+		}; \
+	done
+endef
 
 COSIGN_FLAGS ?= -y -a GIT_HASH=$(GIT_COMMIT) -a GIT_VERSION=$(VERSION) -a BUILD_DATE=$(DATE)
 
@@ -117,6 +130,23 @@ clean-test-certs:
 test:
 	go test ./...
 
+FUZZ_TIME ?= 30s
+FUZZ_TARGETS = \
+	FuzzTableMemoryRoute:./pkg/routing/ \
+	FuzzParseTLSVersion:./interceptor/ \
+	FuzzParseCipherSuites:./interceptor/ \
+	FuzzParseCurvePreferences:./interceptor/ \
+	FuzzProxyHandler:./interceptor/ \
+	FuzzEscapeString:./scaler/
+
+.PHONY: fuzz
+fuzz: ## Run all fuzz tests (FUZZ_TIME=30s by default)
+	@for entry in $(FUZZ_TARGETS); do \
+		func=$${entry%%:*}; pkg=$${entry#*:}; \
+		echo "=== Fuzzing $$func in $$pkg ==="; \
+		go test $$pkg -run='^$$' -fuzz=$$func -fuzztime=$(FUZZ_TIME) || exit 1; \
+	done
+
 e2e-test-legacy:
 	go run -tags e2e ./tests/run-all.go
 
@@ -140,41 +170,48 @@ e2e-test-ci: ## Run all e2e tests (CI mode with retries)
 # -parallel 4 limits concurrent tests to avoid overwhelming the kubelet port-forward
 	gotestsum --rerun-fails=2 --format=github-actions --packages="./test/e2e/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v -parallel 4
 
+e2e-test-images: ## Build all test images under test/images/ and push to $KO_DOCKER_REPO
+	# --base-import-paths prevents the hash suffix in image names
+	ko build --base-import-paths ./test/images/*/
+
 e2e-deps: e2e-deps-cert-manager e2e-deps-jaeger e2e-deps-keda e2e-deps-otel-collector ## Install all e2e dependencies
 
 e2e-deps-cert-manager:
 	helm repo add jetstack https://charts.jetstack.io --force-update
-	helm upgrade --install cert-manager jetstack/cert-manager \
+	$(call helm-retry,helm upgrade --install cert-manager jetstack/cert-manager \
 		--namespace cert-manager --create-namespace \
 		-f test/fixtures/cert-manager-values.yaml \
-		--version $(CERT_MANAGER_VERSION) --wait
+		--version $(CERT_MANAGER_VERSION) --wait --timeout 5m)
 
 e2e-deps-jaeger:
 	helm repo add jaegertracing https://jaegertracing.github.io/helm-charts --force-update
-	helm upgrade --install jaeger jaegertracing/jaeger \
+	$(call helm-retry,helm upgrade --install jaeger jaegertracing/jaeger \
 		--namespace jaeger --create-namespace \
-		--version $(JAEGER_VERSION) --wait
+		--version $(JAEGER_VERSION) --wait --timeout 5m)
 
 e2e-deps-keda:
 	helm repo add kedacore https://kedacore.github.io/charts --force-update
-	helm upgrade --install keda kedacore/keda \
+	$(call helm-retry,helm upgrade --install keda kedacore/keda \
 		--namespace keda --create-namespace \
-		--version $(KEDA_VERSION) --wait
+		--version $(KEDA_VERSION) --wait --timeout 5m)
 
 e2e-deps-otel-collector:
 	helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts --force-update
-	helm upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector \
+	$(call helm-retry,helm upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector \
 		--namespace open-telemetry-system --create-namespace \
 		-f test/fixtures/otel-values.yaml \
-		--version $(OTEL_COLLECTOR_VERSION) --wait
+		--version $(OTEL_COLLECTOR_VERSION) --wait --timeout 5m)
 
-e2e-setup: e2e-deps deploy ## Full e2e setup: install deps + deploy http-add-on
+e2e-setup: e2e-deps deploy e2e-test-images ## Full e2e setup: install deps + deploy http-add-on + build test images
 
 ##################################################
 # Code generation & manifests                    #
 ##################################################
 
 generate: codegen manifests  ## Generate code and manifests.
+
+generate-proto: ## Generate protobuf and gRPC stubs only used in e2e test images
+	buf generate
 
 codegen: ## Generate DeepCopy method implementations.
 	$(CONTROLLER_GEN) object:headerFile='hack/boilerplate.go.txt' paths='./...'

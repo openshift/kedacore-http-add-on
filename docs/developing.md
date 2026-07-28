@@ -12,6 +12,7 @@ You'll need to have the following tools installed:
 - [ko](https://ko.build/) for building container images and deploying
 - [kustomize](https://kubectl.docs.kubernetes.io/installation/kustomize/) for generating Kubernetes manifests
 - [Make](https://www.gnu.org/software/make/) for build automation
+- [buf](https://buf.build/) for protobuf code generation (_optional_, only needed when modifying proto files)
 - [pre-commit](https://pre-commit.com/) for static checks (_optional_)
 
 ## Setting up pre-commit hooks
@@ -42,6 +43,7 @@ Install [KEDA](https://keda.sh/docs/latest/deploy/) on your cluster before deplo
 - `make test`: Run unit tests
 - `make lint`: Run linter
 - `make lint-fix`: Run linter with auto-fix
+- `make e2e-test-images`: Build test images under `test/images/` (needed for gRPC tests)
 - `make e2e-test`: Run all e2e tests against an existing cluster
 - `make generate`: Generate code (DeepCopy) and Kubernetes manifests (run after modifying CRD types or webhook configs)
 - `make deploy`: Build and deploy all components to the cluster
@@ -81,6 +83,20 @@ ko will:
 3. Push to the configured registry
 4. Apply manifests with resolved image references
 
+## Protobuf Code Generation
+
+The gRPC e2e test image (`test/images/grpc-echo/`) uses protobuf. The proto definition and generated Go code live alongside the server in `test/images/grpc-echo/proto/`.
+
+Code generation uses [buf](https://buf.build/) with `protoc-gen-go` and `protoc-gen-go-grpc`, all managed as Go tool dependencies in `go.mod` (no system-wide installation needed). The buf workspace is configured at the repo root (`buf.yaml` + `buf.gen.yaml`).
+
+To regenerate after modifying proto files:
+
+```bash
+make generate-proto
+```
+
+The generated `*.pb.go` files are checked in. Commit them alongside any proto changes.
+
 ## Running E2E Tests
 
 E2E tests live in `test/e2e/` and are organized by **profile**. Each profile groups tests that require a specific HTTP Add-on configuration.
@@ -98,6 +114,16 @@ make e2e-setup
 # Or install individual dependencies (see Makefile for all targets)
 make e2e-deps-otel-collector
 make e2e-deps-jaeger
+```
+
+### Test Images
+
+Custom test images for e2e tests live under `test/images/`, each subdirectory is a standalone Go `main` package built with ko.
+
+Build all test images and push them to `$KO_DOCKER_REPO` before running e2e tests that need them:
+
+```bash
+make e2e-test-images
 ```
 
 ### Running tests
@@ -119,6 +145,17 @@ make e2e-test E2E_ARGS="--labels=area=scaling"
 make e2e-test E2E_ARGS="--dry-run"
 ```
 
-The `PROFILE` variable selects a test profile directory under `test/e2e/` (e.g. `PROFILE=tls` runs `./test/e2e/tls/...`). Each subdirectory in `test/e2e/` is a profile.
+The `PROFILE` variable selects a test profile directory under `test/e2e/` (e.g. `PROFILE=tls` runs `./test/e2e/tls/...`).
+Each subdirectory in `test/e2e/` is a profile.
 The `RUN` variable filters tests by name using Go's `-run` flag (supports regex, e.g. `RUN=TestColdStart` or `RUN="TestHost|TestPath"`).
 The `E2E_ARGS` variable passes flags to the [e2e-framework](https://github.com/kubernetes-sigs/e2e-framework) via `-args` (e.g. `--labels`, `--feature`, `--skip-labels`, `--dry-run`).
+
+### Writing a new test
+
+Add your test to the profile whose add-on configuration it needs (or propose a new profile if none fits).
+
+Each test creates a feature spec with setup and assertions, then runs it against the profile's shared `testenv`.
+The [`test/helpers/`](../test/helpers/) package provides a `Framework` that handles the common boilerplate: creating test apps, interceptor routes, scaled objects, sending requests, and waiting for expected replica counts.
+The framework also manages namespace lifecycle, so individual tests don't need explicit cleanup.
+
+See [`test/e2e/default/cold_start_test.go`](../test/e2e/default/cold_start_test.go) for a complete example of this pattern.

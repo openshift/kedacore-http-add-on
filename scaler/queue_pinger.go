@@ -9,13 +9,14 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	"github.com/kedacore/http-add-on/pkg/queue"
+	"github.com/kedacore/http-add-on/scaler/metrics"
 )
 
 type PingerStatus int32
@@ -45,7 +46,7 @@ type aggregatedCount struct {
 //
 // Sample usage:
 //
-//	pinger := newQueuePinger(lggr, getEndpointsFn, ns, svcName, deplName, adminPort)
+//	pinger := newQueuePinger(lggr, getEndpointsFn, ns, svcName, deplName, adminPort, instruments)
 //	go pinger.start(ctx, ticker)
 type queuePinger struct {
 	getEndpointsFn         k8s.GetEndpointsFunc
@@ -58,17 +59,24 @@ type queuePinger struct {
 	allCounts              map[string]aggregatedCount
 	lggr                   logr.Logger
 	status                 PingerStatus
+	instruments            *metrics.Instruments
 
 	// prevPodCounts tracks the previous RequestCount per pod per key
 	// so we can compute deltas between consecutive polls.
 	prevPodCounts map[string]map[string]int64
+
+	// cachedPodCounts stores the last successful response from each pod,
+	// used to preserve concurrency for unreachable pods still in the
+	// EndpointSlice. Entries are pruned when the pod leaves the
+	// EndpointSlice.
+	cachedPodCounts map[string]queue.Counts
 
 	// rateBuckets holds per-key windowed ring buffers that accumulate
 	// request deltas for rate computation.
 	rateBuckets map[string]*queue.RequestsBuckets
 }
 
-func newQueuePinger(lggr logr.Logger, getEndpointsFn k8s.GetEndpointsFunc, ns, svcName, deplName, adminPort string) *queuePinger {
+func newQueuePinger(lggr logr.Logger, getEndpointsFn k8s.GetEndpointsFunc, ns, svcName, deplName, adminPort string, instruments *metrics.Instruments) *queuePinger {
 	return &queuePinger{
 		getEndpointsFn:         getEndpointsFn,
 		interceptorNS:          ns,
@@ -76,8 +84,10 @@ func newQueuePinger(lggr logr.Logger, getEndpointsFn k8s.GetEndpointsFunc, ns, s
 		interceptorServiceName: deplName,
 		adminPort:              adminPort,
 		lggr:                   lggr,
+		instruments:            instruments,
 		allCounts:              map[string]aggregatedCount{},
 		prevPodCounts:          map[string]map[string]int64{},
+		cachedPodCounts:        map[string]queue.Counts{},
 		rateBuckets:            map[string]*queue.RequestsBuckets{},
 	}
 }
@@ -152,13 +162,18 @@ func (q *queuePinger) fetchAndSaveCounts(ctx context.Context) error {
 	q.pingMut.Lock()
 	defer q.pingMut.Unlock()
 
-	perPod, err := fetchCountsPerPod(ctx, q.lggr, q.getEndpointsFn, q.interceptorNS, q.interceptorSvcName, q.adminPort)
+	fetchStart := time.Now()
+	result, err := fetchCountsPerPod(ctx, q.lggr, q.getEndpointsFn, q.interceptorNS, q.interceptorSvcName, q.adminPort)
+	failedPods := max(0, result.endpointCount-len(result.perPod))
+	q.instruments.RecordFetch(time.Since(fetchStart), result.endpointCount, failedPods, err)
 	if err != nil {
 		q.lggr.Error(err, "getting request counts")
 		q.status = PingerERROR
 		return err
 	}
 	q.status = PingerACTIVE
+
+	perPod := result.perPod
 
 	now := time.Now()
 
@@ -197,12 +212,46 @@ func (q *queuePinger) fetchAndSaveCounts(ctx context.Context) error {
 			agg[key] = ha
 		}
 		q.prevPodCounts[podKey] = newPrev
+		q.cachedPodCounts[podKey] = counts
 	}
 
-	// Prune pods that are no longer reporting.
+	// For unreachable pods still in the EndpointSlice, use cached
+	// concurrency so that partial failures don't cause underreporting.
+	// Only concurrency is replayed — request rate deltas are not
+	// synthesised because we have no way to know what traffic the
+	// unreachable pod handled. This is a deliberate trade-off:
+	// concurrency is a point-in-time gauge (stale > zero), while
+	// rate is a derivative that would be misleading if fabricated.
+	for _, epKey := range result.endpointKeys {
+		if _, reachable := perPod[epKey]; reachable {
+			continue
+		}
+		if cached, ok := q.cachedPodCounts[epKey]; ok {
+			q.lggr.V(1).Info("using cached counts for unreachable pod",
+				"pod", epKey,
+				"cachedHosts", len(cached),
+			)
+			for key, c := range cached {
+				ha := agg[key]
+				ha.concurrency += c.Concurrency
+				agg[key] = ha
+			}
+		}
+	}
+
+	// Prune pods that have left the EndpointSlice entirely.
+	endpointSet := make(map[string]struct{}, len(result.endpointKeys))
+	for _, k := range result.endpointKeys {
+		endpointSet[k] = struct{}{}
+	}
 	for podKey := range q.prevPodCounts {
-		if _, ok := perPod[podKey]; !ok {
+		if _, ok := endpointSet[podKey]; !ok {
 			delete(q.prevPodCounts, podKey)
+		}
+	}
+	for podKey := range q.cachedPodCounts {
+		if _, ok := endpointSet[podKey]; !ok {
+			delete(q.cachedPodCounts, podKey)
 		}
 	}
 
@@ -229,18 +278,37 @@ func (q *queuePinger) fetchAndSaveCounts(ctx context.Context) error {
 	return nil
 }
 
+// fetchResult holds the outcome of a fetch cycle.
+type fetchResult struct {
+	perPod        map[string]queue.Counts
+	endpointKeys  []string
+	endpointCount int
+}
+
 // fetchCountsPerPod fetches counts from every interceptor pod endpoint
-// and returns the raw per-pod results keyed by pod URL string.
-func fetchCountsPerPod(ctx context.Context, lggr logr.Logger, endpointsFn k8s.GetEndpointsFunc, ns, svcName, adminPort string) (map[string]queue.Counts, error) {
+// and returns the raw per-pod results keyed by pod URL string along with
+// the total number of endpoints that were polled.
+//
+// Individual pod failures are logged and skipped. An error is only
+// returned when no pod could be reached at all, so that a single
+// unreachable interceptor (e.g. during a rolling update or spot-node
+// eviction) does not cause the scaler to report NOT_SERVING and get
+// restarted by Kubernetes.
+func fetchCountsPerPod(ctx context.Context, lggr logr.Logger, endpointsFn k8s.GetEndpointsFunc, ns, svcName, adminPort string) (fetchResult, error) {
 	lggr = lggr.WithName("queuePinger.requestCounts")
 
 	endpointURLs, err := k8s.EndpointsForService(ctx, ns, svcName, adminPort, endpointsFn)
 	if err != nil {
-		return nil, err
+		return fetchResult{}, err
 	}
 
 	if len(endpointURLs) == 0 {
-		return nil, fmt.Errorf("there isn't any valid interceptor endpoint")
+		return fetchResult{}, fmt.Errorf("there isn't any valid interceptor endpoint")
+	}
+
+	endpointKeys := make([]string, len(endpointURLs))
+	for i, u := range endpointURLs {
+		endpointKeys[i] = podKey(u)
 	}
 
 	type podResult struct {
@@ -249,32 +317,45 @@ func fetchCountsPerPod(ctx context.Context, lggr logr.Logger, endpointsFn k8s.Ge
 	}
 
 	resultCh := make(chan podResult, len(endpointURLs))
-	fetchGrp, _ := errgroup.WithContext(ctx)
+	var failCount atomic.Int32
 
+	var wg sync.WaitGroup
 	for _, endpoint := range endpointURLs {
 		u := endpoint
-		fetchGrp.Go(func() error {
+		wg.Go(func() {
 			counts, err := queue.GetCounts(http.DefaultClient, u)
 			if err != nil {
 				lggr.Error(err, "getting queue counts from interceptor", "interceptorAddress", u.String())
-				return err
+				failCount.Add(1)
+				return
 			}
 			resultCh <- podResult{key: podKey(u), counts: counts}
-			return nil
 		})
 	}
 
-	if err := fetchGrp.Wait(); err != nil {
-		lggr.Error(err, "fetching all counts failed")
-		return nil, err
-	}
+	wg.Wait()
 	close(resultCh)
 
 	perPod := make(map[string]queue.Counts, len(endpointURLs))
 	for r := range resultCh {
 		perPod[r.key] = r.counts
 	}
-	return perPod, nil
+
+	if n := failCount.Load(); n > 0 {
+		lggr.Info("some interceptor pods were unreachable",
+			"failedPods", n,
+			"totalPods", len(endpointURLs),
+			"successPods", len(perPod),
+		)
+	}
+
+	if len(perPod) == 0 {
+		return fetchResult{endpointKeys: endpointKeys, endpointCount: len(endpointURLs)}, fmt.Errorf(
+			"all %d interceptor pods were unreachable", len(endpointURLs),
+		)
+	}
+
+	return fetchResult{perPod: perPod, endpointKeys: endpointKeys, endpointCount: len(endpointURLs)}, nil
 }
 
 func podKey(u url.URL) string {

@@ -4,6 +4,7 @@ package helpers
 
 import (
 	"cmp"
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -12,7 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+
+	echopb "github.com/kedacore/http-add-on/test/images/grpc-echo/proto"
 )
 
 type Request struct {
@@ -142,22 +148,54 @@ func (f *Framework) AssertStatus(r Request, expectedStatus int) {
 func (f *Framework) WebSocketDial(host, path string) *websocket.Conn {
 	f.t.Helper()
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 45 * time.Second,
-		NetDialContext: (&net.Dialer{
-			Timeout: 10 * time.Second,
-		}).DialContext,
-	}
+	ctx, cancel := context.WithTimeout(f.ctx, 45*time.Second)
+	defer cancel()
 
-	wsURL := url.URL{Scheme: "ws", Host: f.proxyAddr, Path: path}
-	conn, resp, err := dialer.Dial(wsURL.String(), http.Header{"Host": []string{host}})
+	wsURL := url.URL{Scheme: "ws", Host: host, Path: path}
+	//nolint:bodyclose // coder/websocket.Dial documentation: "You never need to close resp.Body yourself"
+	conn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, f.proxyAddr)
+				},
+			},
+		},
+	})
 	if err != nil {
 		f.t.Fatalf("WebSocket dial to %s%s failed: %v", host, path, err)
 	}
-	_ = resp.Body.Close()
-	f.t.Cleanup(func() { _ = conn.Close() })
+	f.t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
 	return conn
+}
+
+// GRPCEchoClient creates a gRPC client for the echo.EchoService service that
+// dials through the interceptor proxy. The authority header is set to host for
+// routing. The connection is closed via t.Cleanup.
+func (f *Framework) GRPCEchoClient(host string, tlsConfig *tls.Config) echopb.EchoServiceClient {
+	f.t.Helper()
+
+	var creds grpc.DialOption
+	if tlsConfig != nil {
+		creds = grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))
+	} else {
+		creds = grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+
+	// passthrough:/// tells gRPC to use the address literally without DNS
+	// resolution, so we can dial our port-forwarded proxy address directly.
+	conn, err := grpc.NewClient(
+		"passthrough:///"+f.proxyAddr,
+		creds,
+		grpc.WithAuthority(host),
+	)
+	if err != nil {
+		f.t.Fatalf("failed to create gRPC client: %v", err)
+	}
+	f.t.Cleanup(func() { _ = conn.Close() })
+
+	return echopb.NewEchoServiceClient(conn)
 }
 
 type whoamiResult struct {
