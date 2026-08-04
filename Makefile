@@ -54,6 +54,16 @@ COSIGN_FLAGS ?= -y -a GIT_HASH=$(GIT_COMMIT) -a GIT_VERSION=$(VERSION) -a BUILD_
 ## Tool Binaries
 CONTROLLER_GEN ?= go tool controller-gen
 
+LOCALBIN ?= $(CURDIR)/bin
+
+# renovate: datasource=github-releases depName=golangci/golangci-lint
+GOLANGCI_LINT_VERSION ?= v2.12.2
+# renovate: datasource=github-releases depName=helm/helm
+HELM_VERSION ?= v4.2.3
+
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+HELM          ?= $(LOCALBIN)/helm-$(HELM_VERSION)
+
 # TODO(v1): remove DOMAINS, ABC_DOMAINS, and the cert targets below when removing the legacy e2e tests.
 define DOMAINS
 basicConstraints=CA:FALSE
@@ -228,14 +238,14 @@ verify-manifests: ## Verify manifests are up to date.
 # Linting & static checks                        #
 ##################################################
 
-fmt:
-	golangci-lint fmt
+fmt: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) fmt
 
-lint:
-	golangci-lint run
+lint: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run
 
-lint-fix:
-	golangci-lint run --fix
+lint-fix: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run --fix
 
 check-links:
 	lychee "./**/*.md"
@@ -301,3 +311,24 @@ sign-images: ## Sign KEDA images published on GitHub Container Registry
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_INTERCEPTOR_SHA_TAG)
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_VERSIONED_TAG)
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_SHA_TAG)
+
+##################################################
+# Tool installation                              #
+##################################################
+
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+$(GOLANGCI_LINT): | $(LOCALBIN)
+	$(call go-install-tool,golangci-lint,github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+$(HELM): | $(LOCALBIN)
+	$(call go-install-tool,helm,helm.sh/helm/v4/cmd/helm,$(HELM_VERSION))
+
+define go-install-tool
+@echo "Installing $(2)@$(3)"
+@rm -f $(LOCALBIN)/$(1)
+@GOBIN=$(LOCALBIN) go install $(2)@$(3)
+@mv $(LOCALBIN)/$(1) $(LOCALBIN)/$(1)-$(3)
+@ln -sf $(1)-$(3) $(LOCALBIN)/$(1)
+endef
