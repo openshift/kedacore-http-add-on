@@ -54,6 +54,16 @@ COSIGN_FLAGS ?= -y -a GIT_HASH=$(GIT_COMMIT) -a GIT_VERSION=$(VERSION) -a BUILD_
 ## Tool Binaries
 CONTROLLER_GEN ?= go tool controller-gen
 
+LOCALBIN ?= $(CURDIR)/bin
+
+# renovate: datasource=github-releases depName=golangci/golangci-lint
+GOLANGCI_LINT_VERSION ?= v2.12.2
+# renovate: datasource=github-releases depName=helm/helm
+HELM_VERSION ?= v4.2.3
+
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+HELM          ?= $(LOCALBIN)/helm-$(HELM_VERSION)
+
 # TODO(v1): remove DOMAINS, ABC_DOMAINS, and the cert targets below when removing the legacy e2e tests.
 define DOMAINS
 basicConstraints=CA:FALSE
@@ -87,6 +97,9 @@ build-interceptor:
 
 build-scaler:
 	go build -o bin/scaler ./scaler
+
+build-grpc-echo:
+	go build -o bin/grpc-echo ./test/images/grpc-echo
 
 build: build-operator build-interceptor build-scaler
 
@@ -205,6 +218,32 @@ e2e-deps-otel-collector:
 e2e-setup: e2e-deps deploy e2e-test-images ## Full e2e setup: install deps + deploy http-add-on + build test images
 
 ##################################################
+# OpenShift CI e2e                               #
+##################################################
+
+e2e-test-openshift-setup: $(HELM) ## Install KEDA via Helm + deploy http-add-on from CI-built images
+	$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install keda kedacore/keda \
+		--namespace keda --create-namespace \
+		--version $(KEDA_VERSION) --wait --timeout 5m)
+	oc kustomize config/default \
+		| sed "s|ko://github.com/kedacore/http-add-on/operator|$${IMAGE_HTTP_ADDON_OPERATOR}|" \
+		| sed "s|ko://github.com/kedacore/http-add-on/interceptor|$${IMAGE_HTTP_ADDON_INTERCEPTOR}|" \
+		| sed "s|ko://github.com/kedacore/http-add-on/scaler|$${IMAGE_HTTP_ADDON_SCALER}|" \
+		| oc apply -f -
+	oc rollout status deploy/keda-add-ons-http-operator -n keda --timeout=5m
+	oc rollout status deploy/keda-add-ons-http-interceptor -n keda --timeout=5m
+	oc rollout status deploy/keda-add-ons-http-scaler -n keda --timeout=5m
+
+# TODO(linkvt): run all profiles (tls, observability) once default is stable
+e2e-test-openshift: PROFILE = default
+e2e-test-openshift: e2e-test ## Run default-profile e2e tests against OpenShift
+
+e2e-test-openshift-clean: $(HELM) ## Tear down http-add-on + KEDA installed by e2e-test-openshift-setup
+	oc kustomize config/default | oc delete -f - --ignore-not-found || true
+	$(HELM) uninstall keda -n keda || true
+
+##################################################
 # Code generation & manifests                    #
 ##################################################
 
@@ -228,14 +267,14 @@ verify-manifests: ## Verify manifests are up to date.
 # Linting & static checks                        #
 ##################################################
 
-fmt:
-	golangci-lint fmt
+fmt: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) fmt
 
-lint:
-	golangci-lint run
+lint: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run
 
-lint-fix:
-	golangci-lint run --fix
+lint-fix: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run --fix
 
 check-links:
 	lychee "./**/*.md"
@@ -301,3 +340,24 @@ sign-images: ## Sign KEDA images published on GitHub Container Registry
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_INTERCEPTOR_SHA_TAG)
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_VERSIONED_TAG)
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_SHA_TAG)
+
+##################################################
+# Tool installation                              #
+##################################################
+
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+$(GOLANGCI_LINT): | $(LOCALBIN)
+	$(call go-install-tool,golangci-lint,github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+$(HELM): | $(LOCALBIN)
+	$(call go-install-tool,helm,helm.sh/helm/v4/cmd/helm,$(HELM_VERSION))
+
+define go-install-tool
+@echo "Installing $(2)@$(3)"
+@rm -f $(LOCALBIN)/$(1)
+@GOBIN=$(LOCALBIN) go install $(2)@$(3)
+@mv $(LOCALBIN)/$(1) $(LOCALBIN)/$(1)-$(3)
+@ln -sf $(1)-$(3) $(LOCALBIN)/$(1)
+endef
