@@ -189,28 +189,28 @@ e2e-test-images: ## Build all test images under test/images/ and push to $KO_DOC
 
 e2e-deps: e2e-deps-cert-manager e2e-deps-jaeger e2e-deps-keda e2e-deps-otel-collector ## Install all e2e dependencies
 
-e2e-deps-cert-manager:
-	helm repo add jetstack https://charts.jetstack.io --force-update
-	$(call helm-retry,helm upgrade --install cert-manager jetstack/cert-manager \
+e2e-deps-cert-manager: $(HELM)
+	$(HELM) repo add jetstack https://charts.jetstack.io --force-update
+	$(call helm-retry,$(HELM) upgrade --install cert-manager jetstack/cert-manager \
 		--namespace cert-manager --create-namespace \
 		-f test/fixtures/cert-manager-values.yaml \
 		--version $(CERT_MANAGER_VERSION) --wait --timeout 5m)
 
-e2e-deps-jaeger:
-	helm repo add jaegertracing https://jaegertracing.github.io/helm-charts --force-update
-	$(call helm-retry,helm upgrade --install jaeger jaegertracing/jaeger \
+e2e-deps-jaeger: $(HELM)
+	$(HELM) repo add jaegertracing https://jaegertracing.github.io/helm-charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install jaeger jaegertracing/jaeger \
 		--namespace jaeger --create-namespace \
 		--version $(JAEGER_VERSION) --wait --timeout 5m)
 
-e2e-deps-keda:
-	helm repo add kedacore https://kedacore.github.io/charts --force-update
-	$(call helm-retry,helm upgrade --install keda kedacore/keda \
+e2e-deps-keda: $(HELM)
+	$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install keda kedacore/keda \
 		--namespace keda --create-namespace \
 		--version $(KEDA_VERSION) --wait --timeout 5m)
 
-e2e-deps-otel-collector:
-	helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts --force-update
-	$(call helm-retry,helm upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector \
+e2e-deps-otel-collector: $(HELM)
+	$(HELM) repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector \
 		--namespace open-telemetry-system --create-namespace \
 		-f test/fixtures/otel-values.yaml \
 		--version $(OTEL_COLLECTOR_VERSION) --wait --timeout 5m)
