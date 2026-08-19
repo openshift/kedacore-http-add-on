@@ -189,28 +189,29 @@ e2e-test-images: ## Build all test images under test/images/ and push to $KO_DOC
 
 e2e-deps: e2e-deps-cert-manager e2e-deps-jaeger e2e-deps-keda e2e-deps-otel-collector ## Install all e2e dependencies
 
-e2e-deps-cert-manager:
-	helm repo add jetstack https://charts.jetstack.io --force-update
-	$(call helm-retry,helm upgrade --install cert-manager jetstack/cert-manager \
+e2e-deps-cert-manager: $(HELM)
+	$(HELM) repo add jetstack https://charts.jetstack.io --force-update
+	$(call helm-retry,$(HELM) upgrade --install cert-manager jetstack/cert-manager \
 		--namespace cert-manager --create-namespace \
 		-f test/fixtures/cert-manager-values.yaml \
 		--version $(CERT_MANAGER_VERSION) --wait --timeout 5m)
 
-e2e-deps-jaeger:
-	helm repo add jaegertracing https://jaegertracing.github.io/helm-charts --force-update
-	$(call helm-retry,helm upgrade --install jaeger jaegertracing/jaeger \
+e2e-deps-jaeger: $(HELM)
+	$(HELM) repo add jaegertracing https://jaegertracing.github.io/helm-charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install jaeger jaegertracing/jaeger \
 		--namespace jaeger --create-namespace \
+		-f test/fixtures/jaeger-values.yaml \
 		--version $(JAEGER_VERSION) --wait --timeout 5m)
 
-e2e-deps-keda:
-	helm repo add kedacore https://kedacore.github.io/charts --force-update
-	$(call helm-retry,helm upgrade --install keda kedacore/keda \
+e2e-deps-keda: $(HELM)
+	$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install keda kedacore/keda \
 		--namespace keda --create-namespace \
 		--version $(KEDA_VERSION) --wait --timeout 5m)
 
-e2e-deps-otel-collector:
-	helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts --force-update
-	$(call helm-retry,helm upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector \
+e2e-deps-otel-collector: $(HELM)
+	$(HELM) repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector \
 		--namespace open-telemetry-system --create-namespace \
 		-f test/fixtures/otel-values.yaml \
 		--version $(OTEL_COLLECTOR_VERSION) --wait --timeout 5m)
@@ -221,11 +222,7 @@ e2e-setup: e2e-deps deploy e2e-test-images ## Full e2e setup: install deps + dep
 # OpenShift CI e2e                               #
 ##################################################
 
-e2e-test-openshift-setup: $(HELM) ## Install KEDA via Helm + deploy http-add-on from CI-built images
-	$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
-	$(call helm-retry,$(HELM) upgrade --install keda kedacore/keda \
-		--namespace keda --create-namespace \
-		--version $(KEDA_VERSION) --wait --timeout 5m)
+e2e-test-openshift-setup: e2e-deps ## Deploy http-add-on from CI-built images
 	oc kustomize config/default \
 		| sed "s|ko://github.com/kedacore/http-add-on/operator|$${IMAGE_HTTP_ADDON_OPERATOR}|" \
 		| sed "s|ko://github.com/kedacore/http-add-on/interceptor|$${IMAGE_HTTP_ADDON_INTERCEPTOR}|" \
@@ -235,9 +232,10 @@ e2e-test-openshift-setup: $(HELM) ## Install KEDA via Helm + deploy http-add-on 
 	oc rollout status deploy/keda-add-ons-http-interceptor -n keda --timeout=5m
 	oc rollout status deploy/keda-add-ons-http-scaler -n keda --timeout=5m
 
-# TODO(linkvt): run all profiles (tls, observability) once default is stable
-e2e-test-openshift: PROFILE = default
-e2e-test-openshift: e2e-test ## Run default-profile e2e tests against OpenShift
+e2e-test-openshift-ci: ## Run all e2e tests against OpenShift (CI mode with retries)
+# -p 1 is needed to run only one profile in parallel
+# -parallel 4 limits concurrent tests to avoid overwhelming the kubelet port-forward
+	go tool gotestsum --rerun-fails=2 --format=standard-verbose $(if $(ARTIFACT_DIR),--junitfile $(ARTIFACT_DIR)/junit.xml) --packages="./test/e2e/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v -parallel 4
 
 e2e-test-openshift-clean: $(HELM) ## Tear down http-add-on + KEDA installed by e2e-test-openshift-setup
 	oc kustomize config/default | oc delete -f - --ignore-not-found || true
