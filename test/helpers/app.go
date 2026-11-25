@@ -11,13 +11,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 )
 
 const (
 	// renovate: datasource=docker
-	defaultImage   = "ghcr.io/traefik/whoami:v1.11.0"
+	defaultImage   = "ghcr.io/traefik/whoami:v1.12.0"
 	defaultPort    = int32(8080)
 	tlsCertsVolume = "tls-certs"
 
@@ -134,7 +133,7 @@ func (a *TestApp) Resources() []k8s.Object {
 			Namespace: a.Namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(a.Replicas),
+			Replicas: new(a.Replicas),
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
@@ -163,9 +162,9 @@ func (a *TestApp) Resources() []k8s.Object {
 						LivenessProbe:  a.probe(5, probeScheme),
 						ReadinessProbe: a.probe(1, probeScheme),
 						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: ptr.To(false),
+							AllowPrivilegeEscalation: new(false),
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-							RunAsNonRoot:             ptr.To(true),
+							RunAsNonRoot:             new(true),
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
